@@ -1,0 +1,82 @@
+# =============================================================================
+# config.yaml — Sports Prediction & Bet Recommendation System
+# =============================================================================
+# API Keys — isi setelah daftar, sistem bisa jalan demo mode tanpa key.
+#
+#   The-Odds-API  → https://the-odds-api.com       (gratis 500 req/bulan)
+#   API-Football  → https://api-football.com        (gratis 100 req/hari)
+# =============================================================================
+
+the_odds_api:
+  api_key:  "YOUR_ODDS_API_KEY_HERE"
+  base_url: "https://api.the-odds-api.com/v4"
+
+api_football:
+  api_key:  "YOUR_API_FOOTBALL_KEY_HERE"
+  base_url: "https://v3.football.api-sports.io"
+
+# ── Liga ──────────────────────────────────────────────────────────────────────
+leagues:
+  epl:
+    name:            "Premier League"
+    flag:            "🏴󠁧󠁢󠁥󠁮󠁧󠁿"
+    sport:           "soccer"
+    odds_key:        "soccer_epl"
+    api_football_id: 39
+    understat_name:  "EPL"
+    season:          2024
+
+  ucl:
+    name:            "Champions League"
+    flag:            "🏆"
+    sport:           "soccer"
+    odds_key:        "soccer_uefa_champs_league"
+    api_football_id: 2
+    understat_name:  "UCL"
+    season:          2024
+
+  nba:
+    name:            "NBA"
+    flag:            "🏀"
+    sport:           "basketball"
+    odds_key:        "basketball_nba"
+    api_football_id: 12
+    season:          2024
+
+  nhl:
+    name:            "NHL"
+    flag:            "🏒"
+    sport:           "hockey"
+    odds_key:        "icehockey_nhl"
+    api_football_id: 57
+    season:          2024
+
+# ── Model Parameters ──────────────────────────────────────────────────────────
+model:
+  # Soccer Poisson
+  home_advantage_goals:    0.35    # Rata-rata keuntungan kandang dalam gol
+  form_weight:             0.40    # Bobot form 5 laga terakhir vs season avg
+  injury_penalty_per_key:  0.08    # Pengurangan rating per pemain kunci cedera
+
+  # NBA/NHL Pythagorean
+  nba_pythagorean_exp:     13.91   # Eksponent standar NBA
+  nhl_pythagorean_exp:     2.37    # Eksponent standar NHL
+
+  # Bet selector
+  min_edge_moneyline:      0.05    # Edge minimum untuk rekomendasikan moneyline
+  min_edge_spread:         0.04    # Edge minimum spread
+  min_edge_ou:             0.04    # Edge minimum over/under
+
+# ── Cache ─────────────────────────────────────────────────────────────────────
+cache:
+  dir:       "cache"
+  ttl_hours:
+    odds:      1
+    fixtures:  6
+    stats:     12
+    injuries:  3
+
+# ── Display ───────────────────────────────────────────────────────────────────
+display:
+  fixtures_days_ahead: 7
+  form_last_n:         5
