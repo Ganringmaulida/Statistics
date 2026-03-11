@@ -1,0 +1,117 @@
+# ═══════════════════════════════════════════════════════════════════════
+# TAMBAHKAN BAGIAN INI KE config.yaml ANDA
+# Lokasi file: D:\Coding\statistics\predictor\config.yaml
+# ═══════════════════════════════════════════════════════════════════════
+#
+# STATUS API KEYS PER LIGA:
+#
+#   NHL  stats + fixtures  → GRATIS, no key needed  ✅ langsung jalan
+#   EPL  stats             → GRATIS, no key needed  ✅ langsung jalan
+#   EPL  fixtures/injuries → API-Football key       ⚠  daftar gratis
+#   UCL  stats + fixtures  → API-Football key       ⚠  daftar gratis
+#   NBA  stats + fixtures  → BallDontLie key        ⚠  daftar gratis
+#   Odds semua liga        → The-Odds-API key       ⚠  daftar gratis
+#
+# ═══════════════════════════════════════════════════════════════════════
+
+# ── 1. API-Football (UCL stats, semua soccer fixtures & injuries) ─────
+#
+#   CARA DAFTAR (GRATIS, 100 req/day):
+#   1. Buka https://dashboard.api-football.com/register
+#   2. Daftar akun gratis
+#   3. Masuk ke dashboard → copy API key
+#   4. Paste di bawah ini
+#
+api_football:
+  api_key: "YOUR_API_FOOTBALL_KEY_HERE"
+  base_url: "https://v3.football.api-sports.io"
+
+
+# ── 2. BallDontLie (NBA stats + schedule) ────────────────────────────
+#
+#   CARA DAFTAR (GRATIS, unlimited req):
+#   1. Buka https://www.balldontlie.io
+#   2. Klik "Get API Key" → daftar dengan email
+#   3. Cek email → copy API key
+#   4. Paste di bawah ini
+#
+balldontlie:
+  api_key: "YOUR_BALLDONTLIE_KEY_HERE"
+  base_url: "https://api.balldontlie.io/v1"
+
+
+# ── 3. The-Odds-API (odds semua liga) ────────────────────────────────
+#
+#   CARA DAFTAR (GRATIS, 500 req/month):
+#   1. Buka https://the-odds-api.com/#get-access
+#   2. Masukkan email → API key dikirim ke email
+#   3. Paste di bawah ini
+#
+the_odds_api:
+  api_key: "YOUR_ODDS_API_KEY_HERE"
+  base_url: "https://api.the-odds-api.com/v4"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# PASTIKAN SECTION leagues SUDAH ADA DENGAN FIELD INI:
+# ═══════════════════════════════════════════════════════════════════════
+
+leagues:
+  epl:
+    name: "Premier League"
+    flag: "🏴󠁧󠁢󠁥󠁮󠁧󠁿"
+    sport: "soccer"
+    odds_key: "soccer_epl"                # The-Odds-API sport key
+    api_football_id: 39                   # API-Football league ID
+    understat_name: "EPL"                 # Understat name (gratis)
+    season: 2024
+
+  ucl:
+    name: "Champions League"
+    flag: "🏆"
+    sport: "soccer"
+    odds_key: "soccer_uefa_champs_league"  # The-Odds-API sport key
+    api_football_id: 2                     # API-Football league ID (UCL = 2)
+    understat_name: "UCL"                  # Tidak support Understat → pakai API-Football
+    season: 2024
+
+  nba:
+    name: "NBA"
+    flag: "🏀"
+    sport: "basketball"
+    odds_key: "basketball_nba"             # The-Odds-API sport key
+    season: 2024                           # BallDontLie season year
+
+  nhl:
+    name: "NHL"
+    flag: "🏒"
+    sport: "hockey"
+    odds_key: "icehockey_nhl"              # The-Odds-API sport key
+    # NHL Official API tidak butuh ID atau season — otomatis ambil current season
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION lain yang harus ada di config.yaml (jika belum ada):
+# ═══════════════════════════════════════════════════════════════════════
+
+model:
+  home_advantage_goals: 0.35
+  form_weight: 0.4
+  injury_penalty_per_key: 0.08
+  nba_pythagorean_exp: 13.91
+  nhl_pythagorean_exp: 2.37
+  min_edge_moneyline: 0.05
+  min_edge_spread: 0.04
+  min_edge_ou: 0.04
+
+cache:
+  dir: "cache"
+  ttl_hours:
+    odds: 1
+    fixtures: 6
+    stats: 12
+    injuries: 3
+
+display:
+  fixtures_days_ahead: 7       # ambil fixture 7 hari ke depan
+  form_last_n: 5

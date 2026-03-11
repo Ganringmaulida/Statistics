@@ -1,18 +1,16 @@
 """
-analytics/probability_engine.py
+analytics/probability_engine.py  [G+1 — Dixon-Coles integrated]
 ─────────────────────────────────────────────────────────────────────────────
 Layer 3: Kalkulasi probabilitas hasil pertandingan.
 
-Soccer  → Bivariate Poisson Distribution
-          Seperti dua mesin pencetak gol yang independen.
-          Dari rata-rata xG masing-masing tim, kita hitung distribusi
-          kemungkinan skor (0-0, 1-0, 1-1, dst.) lalu akumulasi:
-          P(home win) = sum semua skor di mana home > away
+Soccer  → Bivariate Poisson + Dixon-Coles correction
+          Seperti dua mesin pencetak gol yang independen,
+          NAMUN skor rendah (0-0, 1-0, 0-1, 1-1) dikoreksi oleh
+          faktor tau Dixon-Coles karena distribusi Poisson murni
+          over-estimates match ini secara konsisten di dunia nyata.
+          rho diset ke -0.13 (nilai empiris standar dari paper asli 1997).
 
-NBA/NHL → Pythagorean Expectation
-          Diperkenalkan oleh Bill James untuk baseball, diadaptasi
-          untuk setiap olahraga dengan eksponent berbeda.
-          Win% = pts_for^exp / (pts_for^exp + pts_against^exp)
+NBA/NHL → Pythagorean Expectation (Bill James, eksponent per sport)
 ─────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
@@ -27,26 +25,26 @@ from analytics.strength_profiler import TeamProfile
 @dataclass
 class MatchProbability:
     """Hasil kalkulasi probabilitas untuk satu pertandingan."""
-    home_team:      str
-    away_team:      str
-    sport:          str
+    home_team: str
+    away_team: str
+    sport:     str
 
-    # Probabilitas hasil (sum ~ 1.0)
-    p_home_win:     float
-    p_draw:         float        # None untuk NBA/NHL
-    p_away_win:     float
+    p_home_win: float
+    p_draw:     float   # 0.0 untuk NBA/NHL
+    p_away_win: float
 
-    # Expected score / total
-    expected_home:  float        # Expected goals/points home
-    expected_away:  float
+    expected_home: float
+    expected_away: float
 
-    # Implied win% dari odds pasar (untuk perbandingan)
-    market_p_home:  Optional[float] = None
-    market_p_away:  Optional[float] = None
+    market_p_home: Optional[float] = None
+    market_p_away: Optional[float] = None
 
-    # Edge vs pasar
-    edge_moneyline_home: Optional[float] = None   # model - market (positif = value)
+    edge_moneyline_home: Optional[float] = None
     edge_moneyline_away: Optional[float] = None
+
+    # G+1: metadata koreksi
+    dixon_coles_applied: bool = False
+    rho_used:            float = 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -54,21 +52,18 @@ class MatchProbability:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _poisson_pmf(k: int, lam: float) -> float:
-    """P(X = k) untuk distribusi Poisson dengan mean=lam."""
     if lam <= 0:
         return 1.0 if k == 0 else 0.0
     return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
 
 def _american_to_prob(american: float) -> float:
-    """Konversi American odds ke implied probability (tanpa vig removal)."""
     if american > 0:
         return 100 / (american + 100)
     return abs(american) / (abs(american) + 100)
 
 
 def _remove_vig_two_way(p1: float, p2: float) -> tuple[float, float]:
-    """Buang vig dari dua implied probability."""
     total = p1 + p2
     if total <= 0:
         return 0.5, 0.5
@@ -84,8 +79,36 @@ def _remove_vig_three_way(
     return p_home / total, p_draw / total, p_away / total
 
 
+def _clamp_p(v: float) -> float:
+    return max(0.01, min(0.99, v))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Soccer — Bivariate Poisson
+# Dixon-Coles tau correction  [G+1 NEW]
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _dc_tau(x: int, y: int, lam: float, mu: float, rho: float) -> float:
+    """
+    Faktor koreksi Dixon-Coles untuk skor rendah.
+    Ibarat fine-tuning kalibrasi timbangan — Poisson murni
+    sedikit "salah timbang" untuk skor 0-0, 1-0, 0-1, 1-1.
+
+    rho < 0  → korelasi negatif (underdog bermain lebih defensif)
+    rho biasanya antara -0.10 sampai -0.18 untuk sepak bola.
+    """
+    if x == 0 and y == 0:
+        return 1.0 - lam * mu * rho
+    elif x == 0 and y == 1:
+        return 1.0 + lam * rho
+    elif x == 1 and y == 0:
+        return 1.0 + mu * rho
+    elif x == 1 and y == 1:
+        return 1.0 - rho
+    return 1.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Soccer — Bivariate Poisson + Dixon-Coles
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _expected_goals(
@@ -94,18 +117,6 @@ def _expected_goals(
     home_adv: float,
     league_avg_xg: float = 1.35,
 ) -> tuple[float, float]:
-    """
-    Hitung expected goals masing-masing tim.
-
-    Formula:
-      xG_home = league_avg × (home.attack / league_avg_attack)
-                           × (away.defense_concede_rate)
-                           × home_advantage_multiplier
-
-    Karena kita sudah punya rating 0-1, kita sederhanakan:
-      λ_home = league_avg × (0.5 + home.attack) × (1.2 - away.defense_rating)
-               × (1 + home_adv) × home.fatigue
-    """
     lam_home = (
         league_avg_xg
         * (0.5 + home.attack_rating)
@@ -129,29 +140,38 @@ def calc_soccer_probability(
     odds: Optional[dict] = None,
 ) -> MatchProbability:
     """
-    Hitung probabilitas H/D/A via Bivariate Poisson.
-    Simulasi skor 0-0 sampai 8-8 (cukup untuk cover 99.9%+ kasus).
+    Hitung P(H), P(D), P(A) via Bivariate Poisson dengan koreksi Dixon-Coles.
+    Simulasi skor 0-0 sampai 9-9 (cover 99.9%+ kasus realistis).
     """
-    mp        = cfg.get("model", {})
-    home_adv  = float(mp.get("home_advantage_goals", 0.35)) / 3.0
+    mp       = cfg.get("model", {})
+    home_adv = float(mp.get("home_advantage_goals", 0.35)) / 3.0
+    rho      = float(mp.get("dixon_coles_rho", -0.13))   # G+1: configurable
 
     lam_h, lam_a = _expected_goals(home, away, home_adv)
 
-    MAX_GOALS = 9
-    p_home_win = p_draw = p_away_win = 0.0
+    MAX_GOALS       = 10
+    p_home_win      = 0.0
+    p_draw          = 0.0
+    p_away_win      = 0.0
 
     for gh in range(MAX_GOALS):
         for ga in range(MAX_GOALS):
+            # Base Poisson probability
             p = _poisson_pmf(gh, lam_h) * _poisson_pmf(ga, lam_a)
+
+            # Dixon-Coles correction untuk skor rendah [G+1]
+            tau = _dc_tau(gh, ga, lam_h, lam_a, rho)
+            p  *= tau
+
             if gh > ga:
                 p_home_win += p
             elif gh == ga:
-                p_draw += p
+                p_draw     += p
             else:
                 p_away_win += p
 
-    # Normalisasi (minor floating point drift)
-    total = p_home_win + p_draw + p_away_win
+    # Normalisasi (ada minor drift dari koreksi tau)
+    total      = p_home_win + p_draw + p_away_win
     p_home_win /= total
     p_draw     /= total
     p_away_win /= total
@@ -171,21 +191,25 @@ def calc_soccer_probability(
             edge_a = round(p_away_win - market_pa, 4)
 
     return MatchProbability(
-        home_team=home.name, away_team=away.name, sport="soccer",
-        p_home_win=round(p_home_win, 4),
-        p_draw=round(p_draw, 4),
-        p_away_win=round(p_away_win, 4),
-        expected_home=round(lam_h, 2),
-        expected_away=round(lam_a, 2),
-        market_p_home=round(market_ph, 4) if market_ph else None,
-        market_p_away=round(market_pa, 4) if market_pa else None,
-        edge_moneyline_home=edge_h,
-        edge_moneyline_away=edge_a,
+        home_team = home.name,
+        away_team = away.name,
+        sport     = "soccer",
+        p_home_win = round(p_home_win, 4),
+        p_draw     = round(p_draw,     4),
+        p_away_win = round(p_away_win, 4),
+        expected_home = round(lam_h, 2),
+        expected_away = round(lam_a, 2),
+        market_p_home = round(market_ph, 4) if market_ph else None,
+        market_p_away = round(market_pa, 4) if market_pa else None,
+        edge_moneyline_home = edge_h,
+        edge_moneyline_away = edge_a,
+        dixon_coles_applied = True,   # [G+1]
+        rho_used            = rho,    # [G+1]
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NBA — Pythagorean Expectation
+# NBA — Pythagorean Expectation (Log5)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def calc_nba_probability(
@@ -194,34 +218,20 @@ def calc_nba_probability(
     cfg:  dict,
     odds: Optional[dict] = None,
 ) -> MatchProbability:
-    exp = float(cfg.get("model", {}).get("nba_pythagorean_exp", 13.91))
-    mp  = float(cfg.get("model", {}).get("home_advantage_goals", 0.35))
+    mp = float(cfg.get("model", {}).get("home_advantage_goals", 0.35))
 
-    # Expected points per game dengan home advantage
     exp_h = home.pts_for_avg * (1 + mp * 0.02)
     exp_a = away.pts_for_avg
 
-    # Pythagorean win% model untuk matchup ini
-    # P(home win) berdasarkan relative offensive/defensive strength
-    home_off = home.pts_for_avg ** exp
-    home_def = home.pts_against_avg ** exp
-    away_off = away.pts_for_avg ** exp
-    away_def = away.pts_against_avg ** exp
+    wp_home = _clamp_p(home.win_pct * home.fatigue_index)
+    wp_away = _clamp_p(away.win_pct * away.fatigue_index)
 
-    # Log5 formula (Bill James) untuk head-to-head win probability
-    wp_home = home.win_pct * home.fatigue_index
-    wp_away = away.win_pct * away.fatigue_index
-    wp_home = max(0.01, min(0.99, wp_home))
-    wp_away = max(0.01, min(0.99, wp_away))
-
-    # Home court advantage: tambah ~3% untuk tim home
     p_home = (wp_home * (1 - wp_away)) / (
         wp_home * (1 - wp_away) + wp_away * (1 - wp_home)
     )
-    p_home = _clamp_p(p_home + 0.03)
+    p_home = _clamp_p(p_home + 0.03)   # home court +3%
     p_away = 1.0 - p_home
 
-    # Market
     market_ph = market_pa = edge_h = edge_a = None
     if odds:
         ml_h = odds.get("moneyline_home")
@@ -234,12 +244,12 @@ def calc_nba_probability(
             edge_a = round(p_away - market_pa, 4)
 
     return MatchProbability(
-        home_team=home.name, away_team=away.name, sport="basketball",
-        p_home_win=round(p_home, 4), p_draw=0.0, p_away_win=round(p_away, 4),
-        expected_home=round(exp_h, 1), expected_away=round(exp_a, 1),
-        market_p_home=round(market_ph, 4) if market_ph else None,
-        market_p_away=round(market_pa, 4) if market_pa else None,
-        edge_moneyline_home=edge_h, edge_moneyline_away=edge_a,
+        home_team = home.name, away_team = away.name, sport = "basketball",
+        p_home_win = round(p_home, 4), p_draw = 0.0, p_away_win = round(p_away, 4),
+        expected_home = round(exp_h, 1), expected_away = round(exp_a, 1),
+        market_p_home = round(market_ph, 4) if market_ph else None,
+        market_p_away = round(market_pa, 4) if market_pa else None,
+        edge_moneyline_home = edge_h, edge_moneyline_away = edge_a,
     )
 
 
@@ -255,24 +265,20 @@ def calc_nhl_probability(
 ) -> MatchProbability:
     exp = float(cfg.get("model", {}).get("nhl_pythagorean_exp", 2.37))
 
-    gf_h = home.gf_per_game * home.fatigue_index * 1.05   # home ice +5%
+    gf_h = home.gf_per_game * home.fatigue_index * 1.05
     gf_a = away.gf_per_game * away.fatigue_index
     ga_h = home.ga_per_game
     ga_a = away.ga_per_game
 
-    # Expected total goals
     exp_total_h = (gf_h + ga_a) / 2
     exp_total_a = (gf_a + ga_h) / 2
 
-    # Win probability via Pythagorean
-    py_home = home.gf_per_game ** exp / (
-        home.gf_per_game ** exp + home.ga_per_game ** exp
+    py_home = _clamp_p(
+        home.gf_per_game ** exp / (home.gf_per_game ** exp + home.ga_per_game ** exp)
     )
-    py_away = away.gf_per_game ** exp / (
-        away.gf_per_game ** exp + away.ga_per_game ** exp
+    py_away = _clamp_p(
+        away.gf_per_game ** exp / (away.gf_per_game ** exp + away.ga_per_game ** exp)
     )
-    py_home = max(0.01, min(0.99, py_home))
-    py_away = max(0.01, min(0.99, py_away))
 
     p_home = (py_home * (1 - py_away)) / (
         py_home * (1 - py_away) + py_away * (1 - py_home)
@@ -280,7 +286,6 @@ def calc_nhl_probability(
     p_home = _clamp_p(p_home + 0.025)
     p_away = 1.0 - p_home
 
-    # Market
     market_ph = market_pa = edge_h = edge_a = None
     if odds:
         ml_h = odds.get("moneyline_home")
@@ -293,17 +298,13 @@ def calc_nhl_probability(
             edge_a = round(p_away - market_pa, 4)
 
     return MatchProbability(
-        home_team=home.name, away_team=away.name, sport="hockey",
-        p_home_win=round(p_home, 4), p_draw=0.0, p_away_win=round(p_away, 4),
-        expected_home=round(exp_total_h, 2), expected_away=round(exp_total_a, 2),
-        market_p_home=round(market_ph, 4) if market_ph else None,
-        market_p_away=round(market_pa, 4) if market_pa else None,
-        edge_moneyline_home=edge_h, edge_moneyline_away=edge_a,
+        home_team = home.name, away_team = away.name, sport = "hockey",
+        p_home_win = round(p_home, 4), p_draw = 0.0, p_away_win = round(p_away, 4),
+        expected_home = round(exp_total_h, 2), expected_away = round(exp_total_a, 2),
+        market_p_home = round(market_ph, 4) if market_ph else None,
+        market_p_away = round(market_pa, 4) if market_pa else None,
+        edge_moneyline_home = edge_h, edge_moneyline_away = edge_a,
     )
-
-
-def _clamp_p(v: float) -> float:
-    return max(0.01, min(0.99, v))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

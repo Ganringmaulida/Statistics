@@ -1,15 +1,13 @@
 """
 analytics/strength_profiler.py
 ─────────────────────────────────────────────────────────────────────────────
-Layer 2: Konversi data mentah → profil kekuatan dan kelemahan tim.
+Layer 2: Konversi data mentah → profil kekuatan tim.
 
-Setiap tim mendapat 4 rating (0.0–1.0):
-  attack_rating   : seberapa tajam serangan
-  defense_rating  : seberapa solid pertahanan
-  form_score      : momentum 5 laga terakhir
-  fatigue_index   : pengurangan karena cedera pemain kunci
-
-Output akhir adalah TeamProfile yang dipakai oleh probability engine.
+G+1 update:
+  - profile_soccer_teams sekarang menerima data ESPN (scored/missed)
+    maupun Understat (xG/xGA). Jika xG = 0, otomatis fallback ke
+    scored/missed sebagai proxy — seperti navigator yang bisa membaca
+    peta digital maupun peta kertas, hasilnya tetap bisa dipakai.
 ─────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
@@ -21,32 +19,27 @@ from typing import Optional
 
 @dataclass
 class TeamProfile:
-    """Profil lengkap satu tim untuk satu pertandingan."""
     name:           str
-    sport:          str           # "soccer" | "basketball" | "hockey"
+    sport:          str
 
-    # Rating 0.0–1.0
     attack_rating:  float = 0.5
     defense_rating: float = 0.5
     form_score:     float = 0.5
-    fatigue_index:  float = 1.0   # 1.0 = full strength, <1.0 = terganggu cedera
+    fatigue_index:  float = 1.0
 
-    # Raw stats (untuk display)
-    xg_per90:       float = 0.0
-    xga_per90:      float = 0.0
-    pts_for_avg:    float = 0.0   # NBA/NHL: poin per laga
-    pts_against_avg:float = 0.0
-    win_pct:        float = 0.0
-    gf_per_game:    float = 0.0   # NHL
-    ga_per_game:    float = 0.0
+    xg_per90:        float = 0.0
+    xga_per90:       float = 0.0
+    pts_for_avg:     float = 0.0
+    pts_against_avg: float = 0.0
+    win_pct:         float = 0.0
+    gf_per_game:     float = 0.0
+    ga_per_game:     float = 0.0
 
-    # Strength / weakness labels
-    strengths:      list[str] = field(default_factory=list)
-    weaknesses:     list[str] = field(default_factory=list)
-    key_injuries:   list[str] = field(default_factory=list)
+    strengths:    list[str] = field(default_factory=list)
+    weaknesses:   list[str] = field(default_factory=list)
+    key_injuries: list[str] = field(default_factory=list)
 
-    # Overall power score (weighted composite)
-    power_score:    float = 0.0
+    power_score:  float = 0.0
 
 
 def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -54,11 +47,6 @@ def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
 
 
 def _sigmoid_normalize(values: list[float]) -> list[float]:
-    """
-    Normalisasi relatif antar tim dalam satu liga.
-    Seperti kurva nilai ujian — yang terbaik mendapat 1.0,
-    yang paling buruk mendapat ~0.0, rata-rata mendapat 0.5.
-    """
     if not values:
         return []
     mn, mx = min(values), max(values)
@@ -68,7 +56,7 @@ def _sigmoid_normalize(values: list[float]) -> list[float]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Soccer profiler
+# Soccer profiler — handles both Understat (xG) and ESPN (scored/missed)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def profile_soccer_teams(
@@ -76,31 +64,31 @@ def profile_soccer_teams(
     injuries:   list[dict],
     cfg:        dict,
 ) -> dict[str, TeamProfile]:
-    """
-    Buat TeamProfile untuk semua tim di liga sepakbola.
-    Input: data dari Understat (xG, xGA, wins, draws, loses, matches).
-    """
     if not team_stats:
         return {}
 
-    mp = cfg.get("model", {})
+    mp             = cfg.get("model", {})
     injury_penalty = float(mp.get("injury_penalty_per_key", 0.08))
 
-    # Kumpulkan metrik mentah
     xg_per90_list  = []
     xga_per90_list = []
 
     for t in team_stats:
         n = max(t.get("matches", 1), 1)
-        xg_per90_list.append(t.get("xg", 0) / n)
-        xga_per90_list.append(t.get("xga", 0) / n)
 
-    # Normalisasi relatif antar tim
+        # G+1: gunakan xG jika tersedia (Understat), fallback ke scored/missed (ESPN)
+        xg_raw  = t.get("xg",  0)
+        xga_raw = t.get("xga", 0)
+        if xg_raw == 0:
+            xg_raw  = t.get("scored", t.get("gf", 0))
+            xga_raw = t.get("missed", t.get("ga", 0))
+
+        xg_per90_list.append(xg_raw / n)
+        xga_per90_list.append(xga_raw / n)
+
     xg_norm  = _sigmoid_normalize(xg_per90_list)
-    # Untuk xGA: tim dengan xGA lebih RENDAH lebih bagus defensnya
     xga_norm = _sigmoid_normalize([-v for v in xga_per90_list])
 
-    # Indeks cedera per tim
     key_injuries_by_team: dict[str, list[str]] = {}
     for inj in injuries:
         team = inj.get("team", "")
@@ -110,12 +98,12 @@ def profile_soccer_teams(
     profiles: dict[str, TeamProfile] = {}
 
     for i, t in enumerate(team_stats):
-        name    = t.get("team", "")
-        n       = max(t.get("matches", 1), 1)
-        wins    = t.get("wins",   0)
-        draws   = t.get("draws",  0)
-        loses   = t.get("loses",  0)
-        total   = wins + draws + loses or 1
+        name  = t.get("team", "")
+        n     = max(t.get("matches", 1), 1)
+        wins  = t.get("wins",  0)
+        draws = t.get("draws", 0)
+        loses = t.get("loses", 0)
+        total = wins + draws + loses or 1
 
         xg_p90  = xg_per90_list[i]
         xga_p90 = xga_per90_list[i]
@@ -123,56 +111,50 @@ def profile_soccer_teams(
         attack  = _clamp(xg_norm[i])
         defense = _clamp(xga_norm[i])
 
-        # Form score: rasio poin dari 5 laga terakhir yang mungkin
         form_pts = wins * 3 + draws
         form_max = total * 3
         form     = _clamp(form_pts / form_max)
 
-        # Fatigue
         key_inj = key_injuries_by_team.get(name, [])
         fatigue = _clamp(1.0 - len(key_inj) * injury_penalty, 0.5, 1.0)
 
-        # Power score (weighted)
         power = _clamp(
             attack * 0.35 + defense * 0.35 + form * 0.20 + fatigue * 0.10
         )
 
-        # Label kekuatan / kelemahan
         strengths, weaknesses = _label_soccer(attack, defense, form, xg_p90, xga_p90)
 
         profiles[name] = TeamProfile(
             name=name, sport="soccer",
-            attack_rating=round(attack, 3),
-            defense_rating=round(defense, 3),
-            form_score=round(form, 3),
-            fatigue_index=round(fatigue, 3),
-            xg_per90=round(xg_p90, 2),
-            xga_per90=round(xga_p90, 2),
-            win_pct=round(wins / total, 3),
-            power_score=round(power, 3),
-            strengths=strengths,
-            weaknesses=weaknesses,
-            key_injuries=key_inj,
+            attack_rating  = round(attack,  3),
+            defense_rating = round(defense, 3),
+            form_score     = round(form,    3),
+            fatigue_index  = round(fatigue, 3),
+            xg_per90       = round(xg_p90,  2),
+            xga_per90      = round(xga_p90, 2),
+            win_pct        = round(wins / total, 3),
+            power_score    = round(power, 3),
+            strengths      = strengths,
+            weaknesses     = weaknesses,
+            key_injuries   = key_inj,
         )
 
     return profiles
 
 
 def _label_soccer(
-    attack: float,
-    defense: float,
-    form: float,
-    xg_p90: float,
-    xga_p90: float,
+    attack: float, defense: float, form: float,
+    xg_p90: float, xga_p90: float,
 ) -> tuple[list[str], list[str]]:
     s, w = [], []
+    label = "xG/90" if xg_p90 < 5 else "G/90"   # heuristik: xG selalu < 3, goals/90 bisa lebih
 
     if attack > 0.70:
-        s.append(f"Serangan sangat tajam (xG/90: {xg_p90:.2f})")
+        s.append(f"Serangan sangat tajam ({label}: {xg_p90:.2f})")
     elif attack > 0.50:
-        s.append(f"Serangan solid (xG/90: {xg_p90:.2f})")
+        s.append(f"Serangan solid ({label}: {xg_p90:.2f})")
     else:
-        w.append(f"Serangan tumpul (xG/90: {xg_p90:.2f})")
+        w.append(f"Serangan tumpul ({label}: {xg_p90:.2f})")
 
     if defense > 0.70:
         s.append(f"Pertahanan sangat solid (xGA/90: {xga_p90:.2f})")
@@ -201,7 +183,7 @@ def profile_nba_teams(
     if not team_stats:
         return {}
 
-    mp = cfg.get("model", {})
+    mp             = cfg.get("model", {})
     injury_penalty = float(mp.get("injury_penalty_per_key", 0.08))
 
     off_list = [t.get("pts_for",     0) / max(t.get("matches", 1), 1) for t in team_stats]
@@ -223,8 +205,8 @@ def profile_nba_teams(
         loses = t.get("loses", 0)
         total = wins + loses or 1
 
-        off   = off_list[i]
-        defn  = def_list[i]
+        off  = off_list[i]
+        defn = def_list[i]
 
         attack  = _clamp(off_norm[i])
         defense = _clamp(def_norm[i])
@@ -238,14 +220,14 @@ def profile_nba_teams(
 
         profiles[name] = TeamProfile(
             name=name, sport="basketball",
-            attack_rating=round(attack, 3),
-            defense_rating=round(defense, 3),
-            form_score=round(form, 3),
-            fatigue_index=round(fatigue, 3),
-            pts_for_avg=round(off, 1),
-            pts_against_avg=round(defn, 1),
-            win_pct=round(wins / total, 3),
-            power_score=round(power, 3),
+            attack_rating   = round(attack,  3),
+            defense_rating  = round(defense, 3),
+            form_score      = round(form,    3),
+            fatigue_index   = round(fatigue, 3),
+            pts_for_avg     = round(off,  1),
+            pts_against_avg = round(defn, 1),
+            win_pct         = round(wins / total, 3),
+            power_score     = round(power, 3),
             strengths=s, weaknesses=w,
             key_injuries=key_inj,
         )
@@ -265,7 +247,7 @@ def profile_nhl_teams(
     if not team_stats:
         return {}
 
-    mp = cfg.get("model", {})
+    mp             = cfg.get("model", {})
     injury_penalty = float(mp.get("injury_penalty_per_key", 0.08))
 
     gf_list = [t.get("gf", 0) / max(t.get("matches", 1), 1) for t in team_stats]
@@ -283,9 +265,9 @@ def profile_nhl_teams(
     for i, t in enumerate(team_stats):
         name  = t["team"]
         n     = max(t.get("matches", 1), 1)
-        wins  = t.get("wins", 0)
+        wins  = t.get("wins",  0)
         loses = t.get("loses", 0)
-        otl   = t.get("otl",  0)
+        otl   = t.get("otl",   0)
         total = wins + loses + otl or 1
 
         gf_pg = gf_list[i]
@@ -303,14 +285,14 @@ def profile_nhl_teams(
 
         profiles[name] = TeamProfile(
             name=name, sport="hockey",
-            attack_rating=round(attack, 3),
-            defense_rating=round(defense, 3),
-            form_score=round(form, 3),
-            fatigue_index=round(fatigue, 3),
-            gf_per_game=round(gf_pg, 2),
-            ga_per_game=round(ga_pg, 2),
-            win_pct=round(wins / total, 3),
-            power_score=round(power, 3),
+            attack_rating  = round(attack,  3),
+            defense_rating = round(defense, 3),
+            form_score     = round(form,    3),
+            fatigue_index  = round(fatigue, 3),
+            gf_per_game    = round(gf_pg, 2),
+            ga_per_game    = round(ga_pg, 2),
+            win_pct        = round(wins / total, 3),
+            power_score    = round(power, 3),
             strengths=s, weaknesses=w,
             key_injuries=key_inj,
         )

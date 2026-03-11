@@ -1,18 +1,24 @@
 # =============================================================================
-# config.yaml — Sports Prediction & Bet Recommendation System
+# config.yaml — Sports Prediction Engine  [G+1]
 # =============================================================================
-# API Keys — isi setelah daftar, sistem bisa jalan demo mode tanpa key.
 #
-#   The-Odds-API  → https://the-odds-api.com       (gratis 500 req/bulan)
-#   API-Football  → https://api-football.com        (gratis 100 req/hari)
+# API Keys:
+#   The-Odds-API → https://the-odds-api.com  (gratis 500 req/bulan)
+#   API-Football → https://api-football.com  (gratis 100 req/hari)
+#
+# Tanpa API key: sistem otomatis menggunakan sumber gratis:
+#   Soccer  → Understat.com (xG data, no key)
+#   NBA     → stats.nba.com (no key)
+#   NHL     → api-web.nhle.com (official NHL, no key)
+#   Fixtures→ ESPN public API (no key)
 # =============================================================================
 
 the_odds_api:
-  api_key:  "YOUR_ODDS_API_KEY_HERE"
+  api_key:  "c8ea7d6724584c2afb7cd5a557f9ca04"
   base_url: "https://api.the-odds-api.com/v4"
 
 api_football:
-  api_key:  "YOUR_API_FOOTBALL_KEY_HERE"
+  api_key:  "7f9c09188a7c8bea2b60446b8d868e6d"
   base_url: "https://v3.football.api-sports.io"
 
 # ── Liga ──────────────────────────────────────────────────────────────────────
@@ -54,29 +60,36 @@ leagues:
 # ── Model Parameters ──────────────────────────────────────────────────────────
 model:
   # Soccer Poisson
-  home_advantage_goals:    0.35    # Rata-rata keuntungan kandang dalam gol
-  form_weight:             0.40    # Bobot form 5 laga terakhir vs season avg
-  injury_penalty_per_key:  0.08    # Pengurangan rating per pemain kunci cedera
+  home_advantage_goals:    0.35
+
+  # [G+1] Dixon-Coles correction
+  # rho = -0.13 adalah nilai empiris dari paper Dixon & Coles (1997)
+  # Range biasanya -0.08 sampai -0.18. Lebih negatif = koreksi lebih agresif.
+  dixon_coles_rho:         -0.13
+
+  form_weight:             0.40
+  injury_penalty_per_key:  0.08
 
   # NBA/NHL Pythagorean
-  nba_pythagorean_exp:     13.91   # Eksponent standar NBA
-  nhl_pythagorean_exp:     2.37    # Eksponent standar NHL
+  nba_pythagorean_exp:     13.91
+  nhl_pythagorean_exp:     2.37
 
   # Bet selector
-  min_edge_moneyline:      0.05    # Edge minimum untuk rekomendasikan moneyline
-  min_edge_spread:         0.04    # Edge minimum spread
-  min_edge_ou:             0.04    # Edge minimum over/under
+  min_edge_moneyline:      0.05
+  min_edge_spread:         0.04
+  min_edge_ou:             0.04
 
 # ── Cache ─────────────────────────────────────────────────────────────────────
 cache:
-  dir:       "cache"
+  dir: "cache"
   ttl_hours:
     odds:      1
-    fixtures:  6
-    stats:     12
+    fixtures:  3
+    stats:     6       # [G+1] lebih sering refresh untuk data real-time
     injuries:  3
 
 # ── Display ───────────────────────────────────────────────────────────────────
 display:
   fixtures_days_ahead: 7
   form_last_n:         5
+  show_data_source:    true    # [G+1] tampilkan sumber data di UI

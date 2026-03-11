@@ -1,0 +1,218 @@
+{
+  "epl:Liverpool": {
+    "team": "Liverpool",
+    "league": "epl",
+    "rating": 1618.8,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "epl:Arsenal": {
+    "team": "Arsenal",
+    "league": "epl",
+    "rating": 1606.2,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "epl:Chelsea": {
+    "team": "Chelsea",
+    "league": "epl",
+    "rating": 1562.5,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "epl:Manchester City": {
+    "team": "Manchester City",
+    "league": "epl",
+    "rating": 1562.5,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "epl:Aston Villa": {
+    "team": "Aston Villa",
+    "league": "epl",
+    "rating": 1543.8,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "epl:Newcastle": {
+    "team": "Newcastle",
+    "league": "epl",
+    "rating": 1525.0,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "epl:Tottenham": {
+    "team": "Tottenham",
+    "league": "epl",
+    "rating": 1493.8,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "epl:Manchester United": {
+    "team": "Manchester United",
+    "league": "epl",
+    "rating": 1462.5,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "ucl:Real Madrid": {
+    "team": "Real Madrid",
+    "league": "ucl",
+    "rating": 1640.0,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "ucl:Arsenal": {
+    "team": "Arsenal",
+    "league": "ucl",
+    "rating": 1620.0,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "ucl:Bayern Munich": {
+    "team": "Bayern Munich",
+    "league": "ucl",
+    "rating": 1600.0,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "ucl:Atletico Madrid": {
+    "team": "Atletico Madrid",
+    "league": "ucl",
+    "rating": 1600.0,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "ucl:PSG": {
+    "team": "PSG",
+    "league": "ucl",
+    "rating": 1540.0,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "ucl:Inter Milan": {
+    "team": "Inter Milan",
+    "league": "ucl",
+    "rating": 1540.0,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "nba:Oklahoma City Thunder": {
+    "team": "Oklahoma City Thunder",
+    "league": "nba",
+    "rating": 1610.4,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "nba:Cleveland Cavaliers": {
+    "team": "Cleveland Cavaliers",
+    "league": "nba",
+    "rating": 1604.5,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "nba:Boston Celtics": {
+    "team": "Boston Celtics",
+    "league": "nba",
+    "rating": 1598.5,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "nba:Houston Rockets": {
+    "team": "Houston Rockets",
+    "league": "nba",
+    "rating": 1556.7,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "nba:Golden State Warriors": {
+    "team": "Golden State Warriors",
+    "league": "nba",
+    "rating": 1514.9,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "nba:LA Lakers": {
+    "team": "LA Lakers",
+    "league": "nba",
+    "rating": 1497.0,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "nba:Memphis Grizzlies": {
+    "team": "Memphis Grizzlies",
+    "league": "nba",
+    "rating": 1413.4,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "nhl:Washington Capitals": {
+    "team": "Washington Capitals",
+    "league": "nhl",
+    "rating": 1577.4,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "nhl:Winnipeg Jets": {
+    "team": "Winnipeg Jets",
+    "league": "nhl",
+    "rating": 1573.0,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "nhl:Vegas Golden Knights": {
+    "team": "Vegas Golden Knights",
+    "league": "nhl",
+    "rating": 1560.0,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "nhl:Carolina Hurricanes": {
+    "team": "Carolina Hurricanes",
+    "league": "nhl",
+    "rating": 1553.3,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "nhl:Colorado Avalanche": {
+    "team": "Colorado Avalanche",
+    "league": "nhl",
+    "rating": 1546.7,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  },
+  "nhl:Toronto Maple Leafs": {
+    "team": "Toronto Maple Leafs",
+    "league": "nhl",
+    "rating": 1532.3,
+    "matches_played": 0,
+    "last_updated": "",
+    "rating_history": []
+  }
+}
