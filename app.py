@@ -1,6 +1,16 @@
 """
-app.py — Sports Prediction Engine  [G+1]
+app.py — Sports Prediction Engine  [Gen 3]
+══════════════════════════════════════════════════════════════════════════
 Jalankan: python app.py
+
+Menu:
+  1-4  → analisis liga (EPL / UCL / NBA / NHL)
+  5    → semua jadwal
+  6    → analisis pertandingan spesifik
+  7    → backtest report
+  8    → prediction log
+  0    → keluar
+══════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
 
@@ -15,36 +25,53 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from analytics.strength_profiler  import build_profiles
 from analytics.probability_engine import calculate_probability
-from analytics.bet_selector       import recommend_bet
-from analytics.backtester         import Backtester
-from data.fetcher import (
-    get_team_stats, get_fixtures, get_injuries, get_odds,
-    get_data_sources,
+from analytics.bet_selector        import select_bet
+from analytics.backtester          import Backtester
+from analytics.elo_model           import get_matchup as elo_matchup
+from analytics.ensemble            import apply_to_prob
+
+from data.fetcher      import get_team_stats, get_fixtures, get_injuries, get_odds, get_data_sources
+from data.h2h_fetcher  import get_h2h
+from data.odds_tracker import record_odds, analyze_movement
+
+from storage.prediction_log import (
+    save_prediction, make_match_id, PredictionEntry,
+    load_predictions, pending_results, get_performance_summary,
 )
+
 from ui.display import (
     console, print_header, print_section, print_main_menu,
     print_strength_card, print_probability, print_recommendation,
     print_fixtures, print_match_summary_table, print_data_sources,
     prompt, loading, warn, ok,
+    display_match,
 )
+from ui.backtest_report import print_prediction_log, print_pending_results
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s — %(message)s")
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 LEAGUE_KEYS = {"1": "epl", "2": "ucl", "3": "nba", "4": "nhl"}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────────────────────────────────────
+
 def load_cfg(path: str = "config.yaml") -> dict:
-    for p in [Path(path), Path(__file__).parent / path]:
-        if p.exists():
-            return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    raise FileNotFoundError("config.yaml tidak ditemukan")
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Config tidak ditemukan: {path}")
+    with open(p, encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
 def _is_demo(cfg: dict) -> bool:
-    k1 = cfg.get("the_odds_api",  {}).get("api_key", "")
-    k2 = cfg.get("api_football",  {}).get("api_key", "")
-    return (k1 in ("", "YOUR_ODDS_API_KEY_HERE") and
-            k2 in ("", "YOUR_API_FOOTBALL_KEY_HERE"))
+    key = cfg.get("the_odds_api", {}).get("api_key", "")
+    return "YOUR" in key or len(key) < 10
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -59,8 +86,9 @@ def analyse_match(
     cfg:        dict,
     backtester: Backtester | None = None,
 ) -> dict:
-    home_p = profiles.get(home_name)
-    away_p = profiles.get(away_name)
+    sport    = cfg["leagues"][league_key].get("sport", "soccer")
+    home_p   = profiles.get(home_name) or _fuzzy_profile(profiles, home_name)
+    away_p   = profiles.get(away_name) or _fuzzy_profile(profiles, away_name)
 
     if not home_p or not away_p:
         warn(f"Profil tidak ditemukan: {home_name} atau {away_name}")
@@ -68,29 +96,49 @@ def analyse_match(
 
     odds = get_odds(home_name, away_name, league_key, cfg)
     prob = calculate_probability(home_p, away_p, cfg, odds)
-    rec  = recommend_bet(prob, home_p, away_p, odds, cfg)
 
-    # [G+1] Auto-record ke backtester
+    # ── Gen 3: ELO + H2H + Ensemble ─────────────────────────────────────────
+    elo  = elo_matchup(home_name, away_name, league_key, sport, cfg)
+    h2h  = get_h2h(home_name, away_name, league_key, sport, cfg)
+    ens  = apply_to_prob(prob, elo_matchup=elo, h2h=h2h, cfg=cfg)
+
+    bet  = select_bet(prob, odds, cfg)
+
+    # Odds tracking
+    match_id = make_match_id(league_key, home_name, away_name, "")
+    movement = None
+    if odds:
+        record_odds(match_id, odds)
+        movement = analyze_movement(match_id)
+
     if backtester is not None:
-        backtester.record(prob, rec, odds)
+        if hasattr(backtester, "record_prediction"):
+            backtester.record_prediction(prob, bet, odds)
+        elif hasattr(backtester, "record"):
+            backtester.record(prob, bet, odds)
 
     return {
-        "home":         home_name,
-        "away":         away_name,
-        "home_profile": home_p,
-        "away_profile": away_p,
-        "prob":         prob,
-        "rec":          rec,
-        "odds":         odds,
-        "p_home":       prob.p_home_win,
-        "p_away":       prob.p_away_win,
-        "bet_type":     rec.bet_type,
-        "selection":    rec.selection,
-        "confidence":   rec.confidence,
-        "edge":         rec.edge,
-        # [G+1] metadata model
-        "dixon_coles":  getattr(prob, "dixon_coles_applied", False),
+        "home": home_name, "away": away_name,
+        "home_profile": home_p, "away_profile": away_p,
+        "prob": prob, "rec": bet, "odds": odds,
+        "p_home": prob.p_home_win, "p_away": prob.p_away_win,
+        "bet_type": bet.bet_type, "selection": bet.selection,
+        "confidence": bet.confidence, "edge": bet.edge,
+        "dixon_coles": getattr(prob, "dixon_coles_applied", False),
+        "elo": elo, "h2h": h2h, "ens": ens, "movement": movement,
     }
+
+
+def _fuzzy_profile(profiles: dict, name: str):
+    name_l = name.lower()
+    for k, v in profiles.items():
+        if k.lower() == name_l or name_l in k.lower() or k.lower() in name_l:
+            return v
+    words = set(name_l.split())
+    for k, v in profiles.items():
+        if words & set(k.lower().split()):
+            return v
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -100,9 +148,7 @@ def analyse_match(
 def view_league(league_key: str, cfg: dict, backtester: Backtester) -> None:
     lcfg = cfg["leagues"][league_key]
     name = lcfg["name"]
-    flag = lcfg.get("flag", "")
-
-    print_section(f"{flag}  {name}")
+    print_section(f"  {name}")
 
     loading("Mengambil statistik tim")
     stats = get_team_stats(league_key, cfg)
@@ -117,13 +163,12 @@ def view_league(league_key: str, cfg: dict, backtester: Backtester) -> None:
     profiles = build_profiles(league_key, stats, injuries, cfg)
     ok(f"{len(profiles)} profil tim dibangun")
 
-    # [G+1] Tampilkan sumber data
     sources = get_data_sources(league_key, cfg)
     print_data_sources(sources, league_key)
 
     loading("Mengambil jadwal pertandingan")
     fixtures = get_fixtures(league_key, cfg)
-    print_fixtures(fixtures, f"{flag} {name}")
+    print_fixtures(fixtures, name)
 
     if not fixtures:
         warn("Tidak ada jadwal — menampilkan profil tim saja")
@@ -135,24 +180,22 @@ def view_league(league_key: str, cfg: dict, backtester: Backtester) -> None:
     match_results = []
 
     for fix in fixtures:
-        result = analyse_match(
-            fix["home"], fix["away"], league_key, profiles, cfg, backtester
-        )
+        result = analyse_match(fix["home"], fix["away"], league_key, profiles, cfg, backtester)
         if result:
             summary_rows.append(result)
             match_results.append(result)
 
     if summary_rows:
         print_section("📊  Ringkasan Semua Pertandingan")
-        print_match_summary_table(summary_rows, f"{flag} {name}")
+        print_match_summary_table(summary_rows, name)
 
     print_section("🔍  Analisis Detail Per Pertandingan")
     for r in match_results:
-        print_strength_card(r["home_profile"], title_suffix="HOME")
-        print_strength_card(r["away_profile"], title_suffix="AWAY")
-        print_probability(r["prob"], r["home"], r["away"])
-        print_recommendation(r["rec"], r["home"], r["away"])
-        console.print()
+        display_match(
+            prob=r["prob"], fixture={"home": r["home"], "away": r["away"]},
+            bet=r["rec"], elo=r["elo"], h2h=r["h2h"],
+            ens_result=r["ens"], movement=r["movement"], cfg=cfg,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -164,10 +207,9 @@ def view_all_fixtures(cfg: dict) -> None:
     for key in ["epl", "ucl", "nba", "nhl"]:
         lcfg = cfg["leagues"].get(key, {})
         name = lcfg.get("name", key.upper())
-        flag = lcfg.get("flag", "")
-        loading(f"{flag} {name}")
+        loading(f"  {name}")
         fixtures = get_fixtures(key, cfg)
-        print_fixtures(fixtures, f"{flag} {name}")
+        print_fixtures(fixtures, name)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -203,8 +245,11 @@ def view_single_match(cfg: dict, backtester: Backtester) -> None:
 
     print_strength_card(result["home_profile"], "HOME")
     print_strength_card(result["away_profile"], "AWAY")
-    print_probability(result["prob"], home_name, away_name)
-    print_recommendation(result["rec"], home_name, away_name)
+    display_match(
+        prob=result["prob"], fixture={"home": home_name, "away": away_name},
+        bet=result["rec"], elo=result["elo"], h2h=result["h2h"],
+        ens_result=result["ens"], movement=result["movement"], cfg=cfg,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -213,7 +258,27 @@ def view_single_match(cfg: dict, backtester: Backtester) -> None:
 
 def view_backtest(backtester: Backtester) -> None:
     print_section("📈  Backtest Report")
-    backtester.print_summary()
+    if hasattr(backtester, "print_summary"):
+        backtester.print_summary()
+    entries = load_predictions()
+    print_prediction_log(entries, limit=15)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# View: prediction log & performance
+# ─────────────────────────────────────────────────────────────────────────────
+
+def view_prediction_log() -> None:
+    print_section("📋  Prediction Log & Performance")
+    summary = get_performance_summary()
+    console.print(
+        f"  Total : [cyan]{summary['total']}[/]  "
+        f"Accuracy: [{'bright_green' if summary['accuracy'] >= 0.55 else 'yellow'}]{summary['accuracy']:.1%}[/]  "
+        f"ROI: [{'bright_green' if summary['roi'] >= 0 else 'bright_red'}]{summary['roi']:+.1%}[/]"
+    )
+    entries = load_predictions()
+    print_prediction_log(entries)
+    print_pending_results(pending_results())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -229,8 +294,8 @@ def run(cfg: dict) -> None:
         if demo:
             console.print(
                 "  [bold yellow]⚠  Odds market: DEMO[/] — "
-                "Stats/Fixtures: [bold green]REAL-TIME[/] (Understat / NHL API / ESPN)\n"
-                "  [dim]Isi The-Odds-API key di config.yaml untuk odds live.[/]\n"
+                "Stats: [bold green]REAL-TIME[/] (Understat / NHL API / ESPN)\n"
+                "  [dim]Isi API keys di config.yaml untuk odds live.[/]\n"
             )
         print_main_menu(is_demo=demo)
 
@@ -247,6 +312,8 @@ def run(cfg: dict) -> None:
             view_single_match(cfg, backtester)
         elif choice == "7":
             view_backtest(backtester)
+        elif choice == "8":
+            view_prediction_log()
         else:
             warn("Pilihan tidak valid")
 
@@ -254,11 +321,12 @@ def run(cfg: dict) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Sports Prediction Engine [G+1]")
+    parser = argparse.ArgumentParser(description="Sports Prediction Engine [Gen 3]")
     parser.add_argument("--config",   default="config.yaml")
     parser.add_argument("--league",   choices=["epl", "ucl", "nba", "nhl"])
     parser.add_argument("--fixtures", action="store_true")
     parser.add_argument("--backtest", action="store_true")
+    parser.add_argument("--log",      action="store_true", help="Tampilkan prediction log")
     args = parser.parse_args()
 
     try:
@@ -272,6 +340,8 @@ def main() -> None:
         print_header(); view_backtest(bt)
     elif args.fixtures:
         print_header(); view_all_fixtures(cfg)
+    elif args.log:
+        print_header(); view_prediction_log()
     elif args.league:
         print_header(); view_league(args.league, cfg, bt)
     else:

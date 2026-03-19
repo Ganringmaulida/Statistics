@@ -1,95 +1,97 @@
-# =============================================================================
-# config.yaml — Sports Prediction Engine  [G+1]
-# =============================================================================
-#
-# API Keys:
-#   The-Odds-API → https://the-odds-api.com  (gratis 500 req/bulan)
-#   API-Football → https://api-football.com  (gratis 100 req/hari)
-#
-# Tanpa API key: sistem otomatis menggunakan sumber gratis:
-#   Soccer  → Understat.com (xG data, no key)
-#   NBA     → stats.nba.com (no key)
-#   NHL     → api-web.nhle.com (official NHL, no key)
-#   Fixtures→ ESPN public API (no key)
-# =============================================================================
+# config.yaml  [Gen 3 — Updated]
+# ═══════════════════════════════════════════════════════════════════════════
+# Sports Prediction Engine — konfigurasi utama.
+# ═══════════════════════════════════════════════════════════════════════════
 
 the_odds_api:
-  api_key:  "c8ea7d6724584c2afb7cd5a557f9ca04"
+  api_key: "fc5003a2c7beae9a948c68c7f6141e1d"
   base_url: "https://api.the-odds-api.com/v4"
 
 api_football:
-  api_key:  "7f9c09188a7c8bea2b60446b8d868e6d"
+  api_key: "7f9c09188a7c8bea2b60446b8d868e6d"
   base_url: "https://v3.football.api-sports.io"
 
-# ── Liga ──────────────────────────────────────────────────────────────────────
+balldontlie:
+  api_key: "fbcd079a-e024-4d6d-a857-1b4392b84d8e"
+  base_url: "https://api.balldontlie.io/v1"
+
 leagues:
   epl:
-    name:            "Premier League"
-    flag:            "🏴󠁧󠁢󠁥󠁮󠁧󠁿"
-    sport:           "soccer"
-    odds_key:        "soccer_epl"
+    name: "English Premier League"
+    sport: "soccer"
+    understat_name: "EPL"
     api_football_id: 39
-    understat_name:  "EPL"
-    season:          2024
-
+    odds_key: "soccer_epl"
+    odds_enabled: true          # ← aktif: pakai Odds-API credits
+    season: 2024
+    enabled: true
   ucl:
-    name:            "Champions League"
-    flag:            "🏆"
-    sport:           "soccer"
-    odds_key:        "soccer_uefa_champs_league"
+    name: "UEFA Champions League"
+    sport: "soccer"
+    understat_name: ""
     api_football_id: 2
-    understat_name:  "UCL"
-    season:          2024
-
+    odds_key: "soccer_uefa_champs_league"
+    odds_enabled: true          # ← aktif: pakai Odds-API credits
+    season: 2024
+    enabled: true
   nba:
-    name:            "NBA"
-    flag:            "🏀"
-    sport:           "basketball"
-    odds_key:        "basketball_nba"
-    api_football_id: 12
-    season:          2024
-
+    name: "NBA"
+    sport: "basketball"
+    api_football_id: null
+    odds_key: "basketball_nba"
+    odds_enabled: true   # ← nonaktif: hemat credits
+    season: 2024
+    enabled: true
   nhl:
-    name:            "NHL"
-    flag:            "🏒"
-    sport:           "hockey"
-    odds_key:        "icehockey_nhl"
-    api_football_id: 57
-    season:          2024
+    name: "NHL"
+    sport: "hockey"
+    api_football_id: null
+    odds_key: "icehockey_nhl"
+    odds_enabled: true       # ← nonaktif: hemat credits
+    season: "20242025"
+    enabled: true
 
-# ── Model Parameters ──────────────────────────────────────────────────────────
 model:
-  # Soccer Poisson
-  home_advantage_goals:    0.35
+  home_advantage_goals: 0.35
+  dixon_coles_rho: -0.13
+  nba_pythagorean_exp: 13.91
+  nhl_pythagorean_exp: 2.37
+  min_edge_moneyline: 0.05
+  edge_medium_confidence: 0.07
+  edge_high_confidence: 0.12
+  team_similarity_threshold: 0.80
 
-  # [G+1] Dixon-Coles correction
-  # rho = -0.13 adalah nilai empiris dari paper Dixon & Coles (1997)
-  # Range biasanya -0.08 sampai -0.18. Lebih negatif = koreksi lebih agresif.
-  dixon_coles_rho:         -0.13
+ensemble:
+  model_weight: 0.65
+  elo_weight:   0.20
+  h2h_weight:   0.15
 
-  form_weight:             0.40
-  injury_penalty_per_key:  0.08
-
-  # NBA/NHL Pythagorean
-  nba_pythagorean_exp:     13.91
-  nhl_pythagorean_exp:     2.37
-
-  # Bet selector
-  min_edge_moneyline:      0.05
-  min_edge_spread:         0.04
-  min_edge_ou:             0.04
-
-# ── Cache ─────────────────────────────────────────────────────────────────────
 cache:
   dir: "cache"
   ttl_hours:
-    odds:      1
-    fixtures:  3
-    stats:     6       # [G+1] lebih sering refresh untuk data real-time
-    injuries:  3
+    odds:     1
+    fixtures: 3
+    stats:    6
+    injuries: 3
 
-# ── Display ───────────────────────────────────────────────────────────────────
+storage:
+  predictions_log: "storage/predictions_log.json"
+  elo_path:        "storage/elo_ratings.json"
+  results_path:    "storage/results.json"
+
 display:
+  max_fixtures: 5
   fixtures_days_ahead: 7
-  form_last_n:         5
-  show_data_source:    true    # [G+1] tampilkan sumber data di UI
+  show_data_source: true
+  show_elo_ratings: true
+  show_h2h: true
+  show_ensemble_weights: true
+
+scheduler:
+  morning_report_hour: 8
+  evening_check_hour: 18
+  pre_match_hours: 3
+  overnight_cleanup: true
+  snapshot_cleanup_days: 7
+
+  

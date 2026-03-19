@@ -1,26 +1,27 @@
 """
-analytics/bet_selector.py
-─────────────────────────────────────────────────────────────────────────────
-Layer 4: Tentukan BET TYPE terbaik dan berikan rekomendasi final.
+analytics/bet_selector.py  [Gen 3]
+═══════════════════════════════════════════════════════════════════════════
+Bet Selector — mengkonversi probabilitas model menjadi rekomendasi taruhan.
 
-Logic keputusan (seperti pohon keputusan):
+Analoginya: seperti filter saringan emas. Bukan setiap prediksi layak
+dijadikan taruhan — hanya yang punya EDGE positif setelah vig bookmaker
+dikurangkan yang lolos ke tahap rekomendasi. Filter ini memastikan sistem
+tidak overbet dan hanya menarget situasi di mana model punya keunggulan
+nyata terhadap pasar.
 
-  1. Jika ada edge besar vs moneyline → MONEYLINE
-     Alasan: probabilitas model jauh lebih tinggi dari yang diimplikasikan
-             pasar, artinya pasar salah menilai tim ini.
+Logic:
+  1. Hitung implied prob dari American odds (dengan vig)
+  2. Bandingkan dengan probabilitas model (tanpa vig)
+  3. Edge = model_prob - implied_prob
+  4. Jika edge ≥ min_edge_moneyline (default 5%), rekomendasikan bet
+  5. Confidence: HIGH (edge ≥ 12%), MEDIUM (edge ≥ 7%), LOW (edge ≥ 5%)
 
-  2. Jika model setuju siapa yang menang TAPI moneyline terlalu pendek
-     (tim favorit terlalu murah untuk dibeli) → SPREAD
-     Alasan: mengambil spread lebih baik daripada moneyline -250 yang
-             memberikan return kecil untuk risk yang sama.
-
-  3. Jika kedua tim sama-sama bagus atau sama-sama buruk secara ofensif
-     → OVER/UNDER
-     Alasan: ketidakpastian pemenang tinggi, tapi total gol/poin
-             lebih mudah diprediksi dari kekuatan ofensif kolektif.
-
-  4. Jika tidak ada bet yang menarik → PASS (tidak ada value)
-─────────────────────────────────────────────────────────────────────────────
+Tipe bet yang dievaluasi:
+  MONEYLINE (H/A)  — win/lose
+  OVER/UNDER       — total gol/poin
+  SPREAD           — handicap (basketball/hockey)
+  PASS             — tidak ada rekomendasi
+═══════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
 
@@ -28,307 +29,256 @@ from dataclasses import dataclass
 from typing import Optional
 
 from analytics.probability_engine import MatchProbability
-from analytics.strength_profiler  import TeamProfile
 
 
 @dataclass
 class BetRecommendation:
-    """Rekomendasi bet final untuk satu pertandingan."""
-    bet_type:       str               # "MONEYLINE" | "SPREAD" | "OVER" | "UNDER" | "PASS"
-    selection:      str               # "Arsenal ML" / "Over 2.5" / "PASS"
-    confidence:     str               # "HIGH" | "MEDIUM" | "LOW"
-    edge:           Optional[float]   # Edge vs market (jika ada odds)
-    reasoning:      list[str]         # Penjelasan langkah per langkah
-    caution:        list[str]         # Risiko / hal yang perlu diperhatikan
+    """Output akhir bet selector untuk satu pertandingan."""
+    bet_type:   str            # MONEYLINE | SPREAD | OVER | UNDER | PASS
+    selection:  str            # deskripsi pilihan ("Arsenal ML", "Over 2.5", dll)
+    confidence: str            # HIGH | MEDIUM | LOW
+    edge:       Optional[float] = None     # selisih prob model vs pasar
+
+    # Detail odds yang dipakai
+    odds_used:  Optional[float] = None
+    model_prob: Optional[float] = None
+    market_prob: Optional[float] = None
+
+    # Kelly criterion stake suggestion (% bankroll, capped 5%)
+    kelly_pct:  Optional[float] = None
+
+    notes: str = ""
 
 
-def _american_to_return(american: float) -> float:
-    """Berapa dollar return per $100 taruhan."""
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _american_to_prob(american: float) -> float:
+    """American odds → implied probability (DENGAN vig, sebelum removal)."""
     if american > 0:
-        return american
-    return 10_000 / abs(american)
+        return 100.0 / (american + 100.0)
+    return abs(american) / (abs(american) + 100.0)
 
 
-def _edge_label(edge: Optional[float]) -> str:
-    if edge is None:
-        return ""
-    if edge >= 0.10:
-        return "edge sangat besar"
-    if edge >= 0.06:
-        return "edge signifikan"
-    if edge >= 0.03:
-        return "edge moderat"
-    return "edge kecil"
+def _kelly(edge: float, odds_american: float, fraction: float = 0.25) -> float:
+    """
+    Kelly criterion (fractional: default 25% Kelly untuk konservatif).
+    Returns % bankroll yang direkomendasikan untuk dipertaruhkan.
+    Capped di 5% untuk manajemen risiko.
+    """
+    if odds_american > 0:
+        b = odds_american / 100.0
+    else:
+        b = 100.0 / abs(odds_american)
+
+    # Kelly formula: f = (b*p - q) / b
+    p = edge + _american_to_prob(odds_american)  # approx model prob
+    q = 1.0 - p
+    if b <= 0:
+        return 0.0
+    k = (b * p - q) / b
+    if k <= 0:
+        return 0.0
+    return round(min(k * fraction, 0.05), 4)  # cap 5%
 
 
-def _confidence_from_edge(edge: Optional[float]) -> str:
-    if edge is None:
-        return "LOW"
-    if edge >= 0.08:
+def _conf_label(edge: float, cfg: dict) -> str:
+    t_high = cfg.get("model", {}).get("edge_high_confidence",   0.12)
+    t_med  = cfg.get("model", {}).get("edge_medium_confidence", 0.07)
+    if edge >= t_high:
         return "HIGH"
-    if edge >= 0.04:
+    if edge >= t_med:
         return "MEDIUM"
     return "LOW"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Soccer bet selector
+# Evaluators
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _select_soccer(
-    prob:  MatchProbability,
-    home:  TeamProfile,
-    away:  TeamProfile,
-    odds:  Optional[dict],
-    cfg:   dict,
+def _eval_moneyline(
+    prob: MatchProbability,
+    odds: dict,
+    cfg: dict,
+    min_edge: float,
+) -> Optional[BetRecommendation]:
+    """Evaluasi moneyline home dan away."""
+    best_edge = 0.0
+    best_rec  = None
+
+    candidates = [
+        (prob.p_home_win, odds.get("moneyline_home"), prob.home_team, "Home"),
+        (prob.p_away_win, odds.get("moneyline_away"), prob.away_team, "Away"),
+    ]
+
+    for model_p, american, team_name, side in candidates:
+        if american is None or model_p is None:
+            continue
+        imp_p = _american_to_prob(float(american))
+        edge  = model_p - imp_p
+        if edge >= min_edge and edge > best_edge:
+            best_edge = edge
+            best_rec  = BetRecommendation(
+                bet_type    = "MONEYLINE",
+                selection   = f"{team_name} ML ({side})",
+                confidence  = _conf_label(edge, cfg),
+                edge        = round(edge, 4),
+                odds_used   = float(american),
+                model_prob  = round(model_p, 4),
+                market_prob = round(imp_p, 4),
+                kelly_pct   = _kelly(edge, float(american)),
+            )
+    return best_rec
+
+
+def _eval_totals(
+    prob: MatchProbability,
+    odds: dict,
+    cfg: dict,
+    min_edge: float,
+) -> Optional[BetRecommendation]:
+    """Evaluasi OVER/UNDER total skor."""
+    line      = odds.get("total_line")
+    over_odds = odds.get("over_odds")
+    und_odds  = odds.get("under_odds")
+
+    if not line or not over_odds or not und_odds:
+        return None
+
+    expected = prob.expected_home + prob.expected_away
+    if expected <= 0:
+        return None
+
+    import math
+
+    lam  = float(expected)
+    line = float(line)
+
+    def p_over_logspace(lam: float, line: float) -> float:
+        """
+        P(total > line) — dua metode tergantung ukuran lambda:
+
+        Soccer  (lam ≤ 15) : Poisson CDF via log-space → tidak overflow
+        NBA/NHL (lam > 15)  : Normal approximation (CLT valid untuk lam besar)
+                              N(μ=lam, σ=√lam) — akurasi ±1% untuk lam > 20
+        """
+        k = int(line)
+
+        if lam > 15:
+            # Normal approximation: P(X > k) = P(Z > (k+0.5-lam)/√lam)
+            sigma = math.sqrt(lam)
+            z     = (k + 0.5 - lam) / sigma
+            # Erfc approximation untuk P(Z > z)
+            return max(0.0, min(1.0, 0.5 * math.erfc(z / math.sqrt(2))))
+
+        # Log-space Poisson CDF — aman untuk lam ≤ 15
+        log_lam = math.log(lam) if lam > 0 else 0.0
+        log_exp = -lam
+        cdf     = 0.0
+        log_pmf = log_exp   # log P(X=0) = -lam + 0*log(lam) - log(0!) = -lam
+        for i in range(k + 1):
+            cdf += math.exp(log_pmf)
+            if i < k:
+                log_pmf += log_lam - math.log(i + 1)
+        return max(0.0, 1.0 - cdf)
+
+    p_over  = p_over_logspace(lam, line)
+    p_under = 1.0 - p_over
+
+    best_rec = None
+    for model_p, american, label in [
+        (p_over,  over_odds, f"Over {line}"),
+        (p_under, und_odds,  f"Under {line}"),
+    ]:
+        imp_p = _american_to_prob(float(american))
+        edge  = model_p - imp_p
+        if edge >= min_edge:
+            best_rec = BetRecommendation(
+                bet_type    = "OVER" if "Over" in label else "UNDER",
+                selection   = label,
+                confidence  = _conf_label(edge, cfg),
+                edge        = round(edge, 4),
+                odds_used   = float(american),
+                model_prob  = round(model_p, 4),
+                market_prob = round(imp_p, 4),
+                kelly_pct   = _kelly(edge, float(american)),
+            )
+            break
+
+    return best_rec
+
+
+def _eval_spread(
+    prob: MatchProbability,
+    odds: dict,
+    cfg: dict,
+    min_edge: float,
+) -> Optional[BetRecommendation]:
+    """Evaluasi spread/handicap (basketball & hockey)."""
+    spread_home = odds.get("spread_home")
+    spread_odds = odds.get("spread_home_odds")
+
+    if spread_home is None or spread_odds is None:
+        return None
+
+    expected_diff = prob.expected_home - prob.expected_away
+    # Sederhana: jika expected_diff > spread_home → team home cover spread
+    cover_p = 0.55 if expected_diff > float(spread_home) else 0.45
+    imp_p   = _american_to_prob(float(spread_odds))
+    edge    = cover_p - imp_p
+
+    if edge < min_edge:
+        return None
+
+    return BetRecommendation(
+        bet_type    = "SPREAD",
+        selection   = f"{prob.home_team} {spread_home:+.1f}",
+        confidence  = _conf_label(edge, cfg),
+        edge        = round(edge, 4),
+        odds_used   = float(spread_odds),
+        model_prob  = round(cover_p, 4),
+        market_prob = round(imp_p, 4),
+        kelly_pct   = _kelly(edge, float(spread_odds)),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main selector
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PASS = BetRecommendation(bet_type="PASS", selection="PASS", confidence="LOW",
+                          notes="No edge found vs market")
+
+
+def select_bet(
+    prob: MatchProbability,
+    odds: Optional[dict],
+    cfg: dict,
 ) -> BetRecommendation:
-    mp        = cfg.get("model", {})
-    min_edge  = float(mp.get("min_edge_moneyline", 0.05))
-    min_ou    = float(mp.get("min_edge_ou", 0.04))
+    """
+    Evaluasi semua tipe bet dan pilih yang punya edge terbaik.
 
-    reasoning: list[str] = []
-    caution:   list[str] = []
-
-    p_h  = prob.p_home_win
-    p_d  = prob.p_draw
-    p_a  = prob.p_away_win
-    e_h  = prob.edge_moneyline_home
-    e_a  = prob.edge_moneyline_away
-
-    reasoning.append(
-        f"Model probability: {home.name} {p_h:.1%} | Draw {p_d:.1%} | {away.name} {p_a:.1%}"
-    )
-    reasoning.append(
-        f"Expected goals: {home.name} {prob.expected_home:.2f} — {away.name} {prob.expected_away:.2f}"
-    )
-
-    # Cedera
-    if home.key_injuries:
-        caution.append(f"⚠ {home.name} kehilangan pemain kunci: {', '.join(home.key_injuries)}")
-    if away.key_injuries:
-        caution.append(f"⚠ {away.name} kehilangan pemain kunci: {', '.join(away.key_injuries)}")
-
-    # Tidak ada odds — hanya rekomendasi berdasarkan model
+    Prioritas: MONEYLINE > TOTALS > SPREAD
+    Kembalikan PASS jika tidak ada yang memenuhi threshold.
+    """
     if not odds:
-        if p_h > 0.55:
-            return BetRecommendation(
-                "MONEYLINE", f"{home.name} Moneyline", "MEDIUM", None,
-                reasoning + [f"{home.name} unggul probability ({p_h:.1%}) — tidak ada odds untuk konfirmasi edge"],
-                caution + ["Tidak ada data odds pasar — verifikasi manual"]
-            )
-        if p_a > 0.55:
-            return BetRecommendation(
-                "MONEYLINE", f"{away.name} Moneyline", "MEDIUM", None,
-                reasoning + [f"{away.name} unggul probability ({p_a:.1%}) — tidak ada odds"],
-                caution + ["Tidak ada data odds pasar — verifikasi manual"]
-            )
-        # Pertandingan ketat — cek total
-        exp_total = prob.expected_home + prob.expected_away
-        if exp_total > 2.8:
-            return BetRecommendation(
-                "OVER", f"Over {exp_total:.1f}", "LOW", None,
-                reasoning + [f"Expected total {exp_total:.2f} goals — kedua tim ofensif"],
-                caution + ["Tanpa odds pasar, tidak bisa hitung edge"]
-            )
-        return BetRecommendation("PASS", "PASS — Tidak ada value jelas", "LOW", None, reasoning, caution)
-
-    # Ada odds
-    ml_h = odds.get("moneyline_home", 0)
-    ml_a = odds.get("moneyline_away", 0)
-    total_line = odds.get("total_line", 2.5)
-    exp_total  = prob.expected_home + prob.expected_away
-
-    # 1. Moneyline edge
-    best_edge = None
-    best_team = None
-    if e_h and e_h >= min_edge:
-        best_edge, best_team = e_h, ("HOME", home.name, ml_h)
-    if e_a and e_a >= min_edge:
-        if best_edge is None or e_a > best_edge:
-            best_edge, best_team = e_a, ("AWAY", away.name, ml_a)
-
-    if best_team:
-        side, name, ml_odds = best_team
-        reasoning.append(
-            f"Market implied: {home.name} {prob.market_p_home:.1%} | {away.name} {prob.market_p_away:.1%}"
-        )
-        reasoning.append(
-            f"Model vs Market edge: {best_edge:.1%} ({_edge_label(best_edge)})"
-        )
-        # Cek apakah moneyline terlalu pendek (return < $35 per $100)
-        ret = _american_to_return(ml_odds)
-        if ret < 40 and side == "HOME":
-            # Moneyline murah — sarankan spread
-            spread_h  = odds.get("spread_home")
-            spread_odds = odds.get("spread_home_odds")
-            if spread_h is not None:
-                reasoning.append(
-                    f"Moneyline {ml_odds} terlalu pendek (return ${ret:.0f}/$100) — "
-                    f"spread lebih efisien"
-                )
-                return BetRecommendation(
-                    "SPREAD", f"{name} {spread_h:+.1f} ({spread_odds:+d})",
-                    _confidence_from_edge(best_edge), best_edge,
-                    reasoning, caution
-                )
         return BetRecommendation(
-            "MONEYLINE", f"{name} Moneyline ({ml_odds:+d})",
-            _confidence_from_edge(best_edge), best_edge,
-            reasoning, caution
+            bet_type="PASS", selection="PASS", confidence="LOW",
+            notes="No market odds available"
         )
 
-    # 2. Over/Under
-    ou_edge = abs(exp_total - total_line)
-    if exp_total > total_line + 0.4:
-        reasoning.append(
-            f"Model expected total {exp_total:.2f} > line {total_line} "
-            f"(+{exp_total - total_line:.2f} goals) — OVER"
-        )
-        return BetRecommendation(
-            "OVER", f"Over {total_line} ({odds.get('over_odds', 0):+d})",
-            "MEDIUM" if ou_edge > 0.6 else "LOW", None,
-            reasoning, caution
-        )
-    if exp_total < total_line - 0.4:
-        reasoning.append(
-            f"Model expected total {exp_total:.2f} < line {total_line} "
-            f"({total_line - exp_total:.2f} goals under) — UNDER"
-        )
-        return BetRecommendation(
-            "UNDER", f"Under {total_line} ({odds.get('under_odds', 0):+d})",
-            "MEDIUM" if ou_edge > 0.6 else "LOW", None,
-            reasoning, caution
-        )
+    min_edge = float(cfg.get("model", {}).get("min_edge_moneyline", 0.05))
 
-    reasoning.append("Tidak ada bet type dengan edge yang cukup — PASS")
-    return BetRecommendation("PASS", "PASS", "LOW", None, reasoning, caution)
+    candidates = [
+        _eval_moneyline(prob, odds, cfg, min_edge),
+        _eval_totals(   prob, odds, cfg, min_edge),
+        _eval_spread(   prob, odds, cfg, min_edge),
+    ]
 
+    # Pilih edge tertinggi di antara semua kandidat valid
+    valid = [c for c in candidates if c is not None]
+    if not valid:
+        return _PASS
 
-# ─────────────────────────────────────────────────────────────────────────────
-# NBA / NHL bet selector
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _select_nba_nhl(
-    prob:  MatchProbability,
-    home:  TeamProfile,
-    away:  TeamProfile,
-    odds:  Optional[dict],
-    cfg:   dict,
-) -> BetRecommendation:
-    mp       = cfg.get("model", {})
-    min_edge = float(mp.get("min_edge_moneyline", 0.05))
-
-    reasoning: list[str] = []
-    caution:   list[str] = []
-
-    p_h = prob.p_home_win
-    p_a = prob.p_away_win
-    e_h = prob.edge_moneyline_home
-    e_a = prob.edge_moneyline_away
-
-    sport_unit = "pts" if home.sport == "basketball" else "goals"
-
-    reasoning.append(
-        f"Model probability: {home.name} {p_h:.1%} | {away.name} {p_a:.1%}"
-    )
-    reasoning.append(
-        f"Expected {sport_unit}: {home.name} {prob.expected_home:.1f} — "
-        f"{away.name} {prob.expected_away:.1f}"
-    )
-
-    if home.key_injuries:
-        caution.append(f"⚠ {home.name}: {', '.join(home.key_injuries)} cedera")
-    if away.key_injuries:
-        caution.append(f"⚠ {away.name}: {', '.join(away.key_injuries)} cedera")
-
-    if not odds:
-        winner = home.name if p_h > p_a else away.name
-        p_win  = max(p_h, p_a)
-        if p_win > 0.60:
-            return BetRecommendation(
-                "MONEYLINE", f"{winner} Moneyline", "LOW", None,
-                reasoning + [f"{winner} unggul model ({p_win:.1%}) — tidak ada odds pasar"],
-                caution + ["Verifikasi odds manual"]
-            )
-        return BetRecommendation("PASS", "PASS", "LOW", None, reasoning, caution)
-
-    ml_h = odds.get("moneyline_home", 0)
-    ml_a = odds.get("moneyline_away", 0)
-    spread_h = odds.get("spread_home")
-    spread_h_odds = odds.get("spread_home_odds")
-    spread_a = odds.get("spread_away")
-    spread_a_odds = odds.get("spread_away_odds")
-    total_line = odds.get("total_line", 0)
-    exp_total  = prob.expected_home + prob.expected_away
-
-    if prob.market_p_home:
-        reasoning.append(
-            f"Market implied: {home.name} {prob.market_p_home:.1%} | "
-            f"{away.name} {prob.market_p_away:.1%}"
-        )
-
-    # 1. Moneyline edge
-    best_edge = None
-    best_team_info = None
-    if e_h and e_h >= min_edge:
-        best_edge, best_team_info = e_h, ("HOME", home.name, ml_h, spread_h, spread_h_odds)
-    if e_a and e_a >= min_edge:
-        if best_edge is None or e_a > best_edge:
-            best_edge, best_team_info = e_a, ("AWAY", away.name, ml_a, spread_a, spread_a_odds)
-
-    if best_team_info:
-        side, name, ml_odds, spr, spr_odds = best_team_info
-        reasoning.append(f"Edge: {best_edge:.1%} ({_edge_label(best_edge)})")
-        ret = _american_to_return(ml_odds)
-        if ret < 35 and spr is not None:
-            reasoning.append(
-                f"Moneyline {ml_odds:+d} return rendah (${ret:.0f}/$100) — spread lebih efisien"
-            )
-            return BetRecommendation(
-                "SPREAD", f"{name} {spr:+.1f} ({spr_odds:+d})",
-                _confidence_from_edge(best_edge), best_edge, reasoning, caution
-            )
-        return BetRecommendation(
-            "MONEYLINE", f"{name} Moneyline ({ml_odds:+d})",
-            _confidence_from_edge(best_edge), best_edge, reasoning, caution
-        )
-
-    # 2. Over/Under
-    if total_line > 0:
-        diff = exp_total - total_line
-        if diff > total_line * 0.02:
-            reasoning.append(
-                f"Expected total {exp_total:.1f} > line {total_line} (+{diff:.1f}) — OVER"
-            )
-            return BetRecommendation(
-                "OVER", f"Over {total_line} ({odds.get('over_odds', 0):+d})",
-                "MEDIUM" if diff > total_line * 0.03 else "LOW",
-                None, reasoning, caution
-            )
-        if diff < -total_line * 0.02:
-            reasoning.append(
-                f"Expected total {exp_total:.1f} < line {total_line} ({diff:.1f}) — UNDER"
-            )
-            return BetRecommendation(
-                "UNDER", f"Under {total_line} ({odds.get('under_odds', 0):+d})",
-                "MEDIUM", None, reasoning, caution
-            )
-
-    reasoning.append("Tidak ada edge yang signifikan — PASS")
-    return BetRecommendation("PASS", "PASS", "LOW", None, reasoning, caution)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Dispatcher
-# ─────────────────────────────────────────────────────────────────────────────
-
-def recommend_bet(
-    prob:  MatchProbability,
-    home:  TeamProfile,
-    away:  TeamProfile,
-    odds:  Optional[dict],
-    cfg:   dict,
-) -> BetRecommendation:
-    if home.sport == "soccer":
-        return _select_soccer(prob, home, away, odds, cfg)
-    return _select_nba_nhl(prob, home, away, odds, cfg)
+    return max(valid, key=lambda c: c.edge or 0.0)

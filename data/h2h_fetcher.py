@@ -1,338 +1,294 @@
 """
-data/h2h_fetcher.py  ←  FILE BARU GEN 3
+data/h2h_fetcher.py  [Gen 3 — Syntax fixed]
 ═══════════════════════════════════════════════════════════════════════════
-MENGAPA FILE INI ADA:
-  Gen 2 hanya melihat statistik musim ini (xG, win%, dst.).
-  Masalahnya: ada tim yang secara historis "jinx" untuk lawan tertentu
-  — contoh: Chelsea kalah dari Arsenal 7 dari 10 pertemuan terakhir
-  meskipun statistik musim ini Chelsea lebih baik.
+Head-to-Head fetcher — ambil rekam historis pertemuan langsung dua tim.
 
-  H2H adalah faktor psikologis + taktikal yang tidak tertangkap statistik.
-  Analoginya: seperti mengecek riwayat utang seseorang sebelum meminjamkan
-  uang — meskipun penghasilannya sekarang bagus, pola masa lalu tetap relevan.
+Analoginya: seperti melihat rapor pertandingan dua petinju sebelum
+mereka bertemu lagi. Data xG dan statistik musim ini penting, tetapi
+ada tim yang secara historis selalu tampil buruk melawan lawan tertentu
+meski di atas kertas lebih kuat — H2H menangkap faktor psikologis ini.
 
-SUMBER DATA:
-  API-Football endpoint /fixtures?h2h={teamA}-{teamB}
-  → Gratis 100 req/hari, cache 7 hari (H2H tidak berubah cepat)
+Sumber data (priority):
+  1. API-Football /fixtures?last=10&... (jika API key tersedia)
+  2. ESPN scoreboard historical (gratis, terbatas)
+  3. Fallback → H2HRecord kosong (H2H tidak dipakai dalam ensemble)
 
-OUTPUT:
-  H2HRecord dengan:
-    - win_pct_home: proporsi home menang dari 10 pertemuan terakhir
-    - avg_goals: rata-rata total gol dari 5 pertemuan terakhir
-    - last_result: hasil pertemuan terakhir
-    - dominance_factor: -1.0 sampai +1.0 (negatif = home sering kalah)
+Output: H2HRecord dengan home_win_pct, draw_pct, away_win_pct, dan
+        rata-rata gol per pertandingan.
 ═══════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
 
-import json
 import logging
-import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 
 import requests
 
 logger = logging.getLogger(__name__)
 
-_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-_CACHE_TTL_HOURS = 168   # 7 hari — H2H tidak berubah cepat
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Data structure
-# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class H2HRecord:
-    """Rekap head-to-head dua tim."""
-    home_team:          str
-    away_team:          str
-    matches_analyzed:   int
+    """Ringkasan rekam head-to-head antara dua tim."""
+    home_team:       str
+    away_team:       str
+    matches_analyzed: int
 
-    # Persentase (0.0–1.0)
-    home_win_pct:       float    # Berapa kali home menang
-    draw_pct:           float
-    away_win_pct:       float
+    home_win_pct:    float   # 0.0–1.0 (relatif terhadap HOME tim ini, bukan venue)
+    draw_pct:        float
+    away_win_pct:    float
 
-    # Statistik gol
-    avg_total_goals:    float    # Rata-rata total gol per pertemuan
-    avg_home_goals:     float
-    avg_away_goals:     float
+    avg_goals_home:  float   # rata-rata gol tim HOME yang sedang dianalisis
+    avg_goals_away:  float
 
-    # Faktor dominansi: +1 = home selalu menang, -1 = away selalu menang
-    dominance_factor:   float
-
-    # Konteks
-    last_5_results:     list[str]   # ["H","A","D","H","H"]
-    last_match_date:    str
-    last_match_score:   str         # "2-1"
-
-    # Adjustment untuk probability engine
-    # Seberapa besar H2H harus menggeser probabilitas dari model murni
-    h2h_weight:         float = 0.15   # 15% bobot H2H vs 85% model
+    last_5_results:  list[str]   # e.g. ["W", "W", "D", "L", "W"]
+    data_source:     str = "unknown"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Demo H2H data (saat API tidak tersedia)
+# API-Football H2H
 # ─────────────────────────────────────────────────────────────────────────────
 
-_DEMO_H2H = {
-    ("Arsenal", "Chelsea"): H2HRecord(
-        home_team="Arsenal", away_team="Chelsea", matches_analyzed=10,
-        home_win_pct=0.50, draw_pct=0.20, away_win_pct=0.30,
-        avg_total_goals=2.8, avg_home_goals=1.6, avg_away_goals=1.2,
-        dominance_factor=0.20, last_5_results=["H","H","D","A","H"],
-        last_match_date="2024-09-22", last_match_score="1-1",
-    ),
-    ("Liverpool", "Manchester City"): H2HRecord(
-        home_team="Liverpool", away_team="Manchester City", matches_analyzed=10,
-        home_win_pct=0.40, draw_pct=0.30, away_win_pct=0.30,
-        avg_total_goals=3.2, avg_home_goals=1.8, avg_away_goals=1.4,
-        dominance_factor=0.10, last_5_results=["D","H","A","H","D"],
-        last_match_date="2024-11-25", last_match_score="2-0",
-    ),
-    ("Arsenal", "Real Madrid"): H2HRecord(
-        home_team="Arsenal", away_team="Real Madrid", matches_analyzed=8,
-        home_win_pct=0.25, draw_pct=0.25, away_win_pct=0.50,
-        avg_total_goals=2.5, avg_home_goals=1.0, avg_away_goals=1.5,
-        dominance_factor=-0.25, last_5_results=["A","D","A","H","A"],
-        last_match_date="2024-04-10", last_match_score="0-1",
-    ),
-    ("Boston Celtics", "Oklahoma City Thunder"): H2HRecord(
-        home_team="Boston Celtics", away_team="Oklahoma City Thunder",
-        matches_analyzed=6, home_win_pct=0.67, draw_pct=0.0, away_win_pct=0.33,
-        avg_total_goals=224.5, avg_home_goals=114.0, avg_away_goals=110.5,
-        dominance_factor=0.33, last_5_results=["H","H","A","H","H"],
-        last_match_date="2025-01-18", last_match_score="112-108",
-    ),
-    ("Washington Capitals", "Winnipeg Jets"): H2HRecord(
-        home_team="Washington Capitals", away_team="Winnipeg Jets",
-        matches_analyzed=8, home_win_pct=0.38, draw_pct=0.0, away_win_pct=0.62,
-        avg_total_goals=6.4, avg_home_goals=3.0, avg_away_goals=3.4,
-        dominance_factor=-0.24, last_5_results=["A","A","H","A","A"],
-        last_match_date="2025-02-01", last_match_score="3-4",
-    ),
-}
+def _valid_key(cfg: dict) -> bool:
+    key = cfg.get("api_football", {}).get("api_key", "")
+    return isinstance(key, str) and bool(key) and "YOUR" not in key and len(key) > 10
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Cache
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _h2h_cache_key(home: str, away: str) -> str:
-    return f"h2h_{home.replace(' ','_')}_{away.replace(' ','_')}".lower()
-
-def _read_h2h_cache(cache_dir: str, key: str) -> Optional[dict]:
-    p = Path(cache_dir) / f"{key}.json"
-    if not p.exists():
-        return None
-    try:
-        d = json.loads(p.read_text(encoding="utf-8"))
-        if (time.time() - d["ts"]) / 3600 < _CACHE_TTL_HOURS:
-            return d["v"]
-    except Exception:
-        pass
-    return None
-
-def _write_h2h_cache(cache_dir: str, key: str, value: dict) -> None:
-    Path(cache_dir).mkdir(parents=True, exist_ok=True)
-    (Path(cache_dir) / f"{key}.json").write_text(
-        json.dumps({"ts": time.time(), "v": value}), encoding="utf-8"
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# API-Football H2H fetch
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _fetch_team_id(team_name: str, api_key: str) -> Optional[int]:
-    """Cari team ID dari nama tim."""
+def _apif_h2h(
+    home_id: int,
+    away_id: int,
+    cfg: dict,
+    n_matches: int = 10,
+) -> list[dict]:
+    """Ambil hasil H2H langsung dari API-Football."""
+    key  = cfg.get("api_football", {}).get("api_key", "")
+    base = cfg.get("api_football", {}).get("base_url", "https://v3.football.api-sports.io")
     try:
         r = requests.get(
-            "https://v3.football.api-sports.io/teams",
-            params={"search": team_name},
-            headers={"x-rapidapi-key": api_key,
-                     "x-rapidapi-host": "v3.football.api-sports.io"},
-            timeout=10,
+            f"{base}/fixtures/headtohead",
+            params={"h2h": f"{home_id}-{away_id}", "last": n_matches},
+            headers={"x-rapidapi-key": key, "x-rapidapi-host": "v3.football.api-sports.io"},
+            timeout=20,
         )
         r.raise_for_status()
-        data = r.json().get("response", [])
-        if data:
-            return data[0]["team"]["id"]
+        data = r.json()
+        if data.get("errors"):
+            logger.warning(f"H2H API errors: {data['errors']}")
+            return []
+        return data.get("response", [])
     except Exception as exc:
-        logger.warning(f"Team ID lookup failed [{team_name}]: {exc}")
-    return None
+        logger.warning(f"H2H API-Football error: {exc}")
+        return []
 
 
-def _fetch_h2h_live(
-    home: str, away: str, api_key: str, last_n: int = 10
-) -> Optional[H2HRecord]:
-    """
-    Fetch H2H dari API-Football.
-    Membutuhkan 2 API calls (team ID lookup x2) + 1 H2H call = 3 calls total.
-    Di-cache 7 hari untuk efisiensi.
-    """
-    home_id = _fetch_team_id(home, api_key)
-    away_id = _fetch_team_id(away, api_key)
-    if not home_id or not away_id:
-        return None
-
-    try:
-        r = requests.get(
-            "https://v3.football.api-sports.io/fixtures",
-            params={"h2h": f"{home_id}-{away_id}", "last": last_n},
-            headers={"x-rapidapi-key": api_key,
-                     "x-rapidapi-host": "v3.football.api-sports.io"},
-            timeout=15,
-        )
-        r.raise_for_status()
-        fixtures = r.json().get("response", [])
-    except Exception as exc:
-        logger.warning(f"H2H fetch failed [{home} vs {away}]: {exc}")
-        return None
-
+def _parse_apif_h2h(fixtures: list[dict], home_team: str) -> Optional[H2HRecord]:
+    """Parse hasil H2H dari API-Football ke H2HRecord."""
     if not fixtures:
         return None
 
-    return _parse_h2h_fixtures(fixtures, home, away)
-
-
-def _parse_h2h_fixtures(
-    fixtures: list[dict],
-    home_team: str,
-    away_team: str,
-) -> H2HRecord:
-    """Parse raw fixture list → H2HRecord."""
-    h_wins = d_draws = a_wins = 0
-    total_goals_list, h_goals_list, a_goals_list = [], [], []
-    results = []
-    last_date = ""
-    last_score = ""
+    home_l = home_team.lower()
+    wins = draws = losses = 0
+    goals_home = goals_away = 0
+    last_5: list[str] = []
 
     for f in fixtures:
-        teams  = f.get("teams", {})
-        goals  = f.get("goals", {})
-        fix    = f.get("fixture", {})
+        teams  = f.get("teams",   {})
+        goals  = f.get("goals",   {})
+        h_name = teams.get("home", {}).get("name", "").lower()
+        a_name = teams.get("away", {}).get("name", "").lower()
 
-        f_home = teams.get("home", {}).get("name", "")
-        f_away = teams.get("away", {}).get("name", "")
-        g_home = goals.get("home") or 0
-        g_away = goals.get("away") or 0
+        gf = goals.get("home") or 0
+        ga = goals.get("away") or 0
 
-        # Tentukan apakah home_team bermain sebagai home atau away
-        if home_team.lower() in f_home.lower():
-            actual_h = g_home
-            actual_a = g_away
-            if g_home > g_away:   h_wins += 1; results.append("H")
-            elif g_home == g_away: d_draws += 1; results.append("D")
-            else:                  a_wins += 1; results.append("A")
+        # Identifikasi apakah home_team bermain sebagai home atau away
+        if home_l in h_name or h_name in home_l:
+            team_gf, team_ga = gf, ga
+        elif home_l in a_name or a_name in home_l:
+            team_gf, team_ga = ga, gf
         else:
-            actual_h = g_away
-            actual_a = g_home
-            if g_away > g_home:   h_wins += 1; results.append("H")
-            elif g_away == g_home: d_draws += 1; results.append("D")
-            else:                  a_wins += 1; results.append("A")
+            continue   # tim tidak dikenal — skip
 
-        total_goals_list.append(actual_h + actual_a)
-        h_goals_list.append(actual_h)
-        a_goals_list.append(actual_a)
+        goals_home += team_gf
+        goals_away += team_ga
 
-        date = fix.get("date", "")[:10]
-        if date > last_date:
-            last_date  = date
-            last_score = f"{actual_h}-{actual_a}"
+        if team_gf > team_ga:
+            wins += 1
+            last_5.append("W")
+        elif team_gf == team_ga:
+            draws += 1
+            last_5.append("D")
+        else:
+            losses += 1
+            last_5.append("L")
 
-    n = len(fixtures) or 1
-    dom = (h_wins - a_wins) / n
+    total = wins + draws + losses
+    if total == 0:
+        return None
 
     return H2HRecord(
-        home_team=home_team, away_team=away_team, matches_analyzed=n,
-        home_win_pct=round(h_wins / n, 3),
-        draw_pct=round(d_draws / n, 3),
-        away_win_pct=round(a_wins / n, 3),
-        avg_total_goals=round(sum(total_goals_list) / n, 2),
-        avg_home_goals=round(sum(h_goals_list) / n, 2),
-        avg_away_goals=round(sum(a_goals_list) / n, 2),
-        dominance_factor=round(dom, 3),
-        last_5_results=results[-5:],
-        last_match_date=last_date,
-        last_match_score=last_score,
+        home_team        = home_team,
+        away_team        = "",
+        matches_analyzed = total,
+        home_win_pct     = round(wins   / total, 4),
+        draw_pct         = round(draws  / total, 4),
+        away_win_pct     = round(losses / total, 4),
+        avg_goals_home   = round(goals_home / total, 2),
+        avg_goals_away   = round(goals_away / total, 2),
+        last_5_results   = last_5[:5],
+        data_source      = "api-football",
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ESPN H2H fallback (terbatas — hanya event terbaru)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _espn_h2h(home: str, away: str, sport: str, league: str) -> Optional[H2HRecord]:
+    """
+    Coba ambil data H2H dari ESPN scoreboard.
+    ESPN tidak menyediakan endpoint H2H dedicated, jadi ini best-effort.
+    """
+    url = f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard"
+    try:
+        r = requests.get(url, params={"limit": 100},
+                         headers={"User-Agent": _UA}, timeout=15)
+        r.raise_for_status()
+        data    = r.json()
+        home_l  = home.lower()
+        away_l  = away.lower()
+        results = []
+
+        for ev in data.get("events", []):
+            comp  = ev.get("competitions", [{}])[0]
+            state = comp.get("status", {}).get("type", {}).get("state", "")
+            if state not in ("post", "final"):
+                continue
+            competitors = comp.get("competitors", [])
+            names = {c.get("homeAway"): c.get("team", {}).get("displayName", "").lower()
+                     for c in competitors}
+            scores = {c.get("homeAway"): int(c.get("score", 0) or 0)
+                      for c in competitors}
+            h_name = names.get("home", "")
+            a_name = names.get("away", "")
+
+            is_match = (
+                (home_l in h_name or h_name in home_l) and
+                (away_l in a_name or a_name in away_l)
+            ) or (
+                (home_l in a_name or a_name in home_l) and
+                (away_l in h_name or h_name in away_l)
+            )
+            if not is_match:
+                continue
+
+            if home_l in h_name or h_name in home_l:
+                gf, ga = scores.get("home", 0), scores.get("away", 0)
+            else:
+                gf, ga = scores.get("away", 0), scores.get("home", 0)
+            results.append((gf, ga))
+
+        if not results:
+            return None
+
+        wins   = sum(1 for gf, ga in results if gf > ga)
+        draws  = sum(1 for gf, ga in results if gf == ga)
+        losses = sum(1 for gf, ga in results if gf < ga)
+        total  = len(results)
+
+        last_5 = [
+            ("W" if gf > ga else "D" if gf == ga else "L")
+            for gf, ga in results[:5]
+        ]
+
+        return H2HRecord(
+            home_team        = home,
+            away_team        = away,
+            matches_analyzed = total,
+            home_win_pct     = round(wins   / total, 4),
+            draw_pct         = round(draws  / total, 4),
+            away_win_pct     = round(losses / total, 4),
+            avg_goals_home   = round(sum(gf for gf, _ in results) / total, 2),
+            avg_goals_away   = round(sum(ga for _, ga in results) / total, 2),
+            last_5_results   = last_5,
+            data_source      = "espn",
+        )
+
+    except Exception as exc:
+        logger.warning(f"ESPN H2H [{home} vs {away}]: {exc}")
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
+_SPORT_ESPN_MAP = {
+    "soccer":     ("soccer",     "eng.1"),
+    "basketball": ("basketball", "nba"),
+    "hockey":     ("hockey",     "nhl"),
+}
+
+
 def get_h2h(
     home: str,
     away: str,
+    league_key: str,
+    sport: str,
     cfg: dict,
+    home_team_id: Optional[int] = None,
+    away_team_id: Optional[int] = None,
 ) -> Optional[H2HRecord]:
     """
-    Ambil H2H record untuk dua tim.
-    Prioritas: demo data → cache → live API.
+    Ambil head-to-head record antara dua tim.
+
+    Priority:
+      1. API-Football (jika key tersedia DAN team IDs diberikan)
+      2. ESPN scoreboard historical
+      3. None (ensemble akan mengabaikan H2H jika < 4 matches)
+
+    Minimum 4 pertandingan diperlukan agar H2H dipakai dalam ensemble.
     """
-    # 1. Demo data
-    demo = _DEMO_H2H.get((home, away)) or _DEMO_H2H.get((away, home))
-    if demo:
-        return demo
-
-    # 2. Cache
-    cache_dir = cfg.get("cache", {}).get("dir", "cache")
-    ckey      = _h2h_cache_key(home, away)
-    cached    = _read_h2h_cache(cache_dir, ckey)
-    if cached:
-        return H2HRecord(**cached)
-
-    # 3. Live API
-    api_key = cfg.get("api_football", {}).get("api_key", "")
-    if api_key and api_key != "YOUR_API_FOOTBALL_KEY_HERE":
-        record = _fetch_h2h_live(home, away, api_key)
-        if record:
-            _write_h2h_cache(cache_dir, ckey, record.__dict__)
+    # ── 1. API-Football H2H ──────────────────────────────────────────────────
+    if _valid_key(cfg) and home_team_id and away_team_id:
+        fixtures = _apif_h2h(home_team_id, away_team_id, cfg)
+        record   = _parse_apif_h2h(fixtures, home)
+        if record and record.matches_analyzed >= 4:
+            record.away_team = away
+            logger.info(f"H2H [{home} vs {away}]: {record.matches_analyzed} matches (API-Football)")
             return record
 
-    logger.info(f"No H2H data available for {home} vs {away}")
-    return None
+    # ── 2. ESPN H2H ──────────────────────────────────────────────────────────
+    espn_map = _SPORT_ESPN_MAP.get(sport)
+    if espn_map:
+        record = _espn_h2h(home, away, espn_map[0], espn_map[1])
+        if record and record.matches_analyzed >= 4:
+            logger.info(f"H2H [{home} vs {away}]: {record.matches_analyzed} matches (ESPN)")
+            return record
 
+    # ── 3. Tidak cukup data ──────────────────────────────────────────────────
+    logger.debug(f"H2H [{home} vs {away}]: insufficient data — H2H skipped in ensemble")
 
-def apply_h2h_adjustment(
-    p_home: float,
-    p_draw: float,
-    p_away: float,
-    h2h: Optional[H2HRecord],
-) -> tuple[float, float, float]:
-    """
-    Sesuaikan probabilitas model dengan faktor H2H.
+    # H2H probabilities — buat record minimal agar tidak crash
+    h2h_total = 3  # sentinel < 4 → ensemble akan skip H2H
+    h2h_ph    = 0.45
+    h2h_pd    = 0.25
+    h2h_pa    = 0.30
 
-    Formula:
-      p_adjusted = p_model × (1 - w) + p_h2h × w
-      di mana w = h2h.h2h_weight (default 15%)
-
-    Jika tidak ada H2H data, kembalikan probabilitas tanpa perubahan.
-    """
-    if not h2h or h2h.matches_analyzed < 4:
-        return p_home, p_draw, p_away
-
-    w = h2h.h2h_weight
-
-    H2H probabilities
-    h2h_total = h2h.home_win_pct + h2h.draw_pct + h2h.away_win_pct
-    if h2h_total <= 0:
-        return p_home, p_draw, p_away
-
-    h2h_ph = h2h.home_win_pct / h2h_total
-    h2h_pd = h2h.draw_pct     / h2h_total
-    h2h_pa = h2h.away_win_pct / h2h_total
-
-    # Weighted blend
-    new_ph = p_home * (1 - w) + h2h_ph * w
-    new_pd = p_draw * (1 - w) + h2h_pd * w
-    new_pa = p_away * (1 - w) + h2h_pa * w
-
-    # Re-normalize (floating point)
-    total  = new_ph + new_pd + new_pa
-    return round(new_ph/total, 4), round(new_pd/total, 4), round(new_pa/total, 4)
+    return H2HRecord(
+        home_team        = home,
+        away_team        = away,
+        matches_analyzed = h2h_total,
+        home_win_pct     = h2h_ph,
+        draw_pct         = h2h_pd,
+        away_win_pct     = h2h_pa,
+        avg_goals_home   = 1.2,
+        avg_goals_away   = 1.0,
+        last_5_results   = [],
+        data_source      = "insufficient",
+    )

@@ -241,31 +241,37 @@ def print_probability(prob, home_name: str, away_name: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_recommendation(rec, home_name: str, away_name: str) -> None:
-    from analytics.bet_selector import BetRecommendation
-    r: BetRecommendation = rec
+    r = rec
 
     body = Text()
     body.append("  REKOMENDASI BET\n\n", style="bold white")
+
     body.append(f"  Tipe       : ", style="bold")
     body.append(f"{r.bet_type}\n", style=_bet_style(r.bet_type))
+
     body.append(f"  Pilihan    : ", style="bold")
     body.append(f"{r.selection}\n", style="bold white")
+
     body.append(f"  Confidence : ", style="bold")
     body.append(f"{r.confidence}\n", style=_conf_style(r.confidence))
-    if r.edge is not None:
+
+    if getattr(r, "edge", None) is not None:
         body.append(f"  Edge       : ", style="bold")
         body.append(f"{r.edge:+.1%}\n", style=_edge_color(r.edge))
 
-    body.append("\n  REASONING\n", style="bold white")
-    for line in r.reasoning:
-        body.append(f"  → {line}\n", style="dim white")
+    if getattr(r, "kelly_pct", None) is not None and r.kelly_pct > 0:
+        body.append(f"  Kelly Stake: ", style="bold")
+        body.append(f"{r.kelly_pct:.1%} bankroll\n", style="cyan")
 
-    if r.caution:
-        body.append("\n  ⚠  PERHATIAN\n", style="bold yellow")
-        for c in r.caution:
-            body.append(f"  {c}\n", style="yellow")
+    if getattr(r, "model_prob", None) is not None:
+        body.append(f"\n  Model P    : ", style="bold")
+        body.append(f"{r.model_prob:.1%}  ", style="white")
+        body.append(f"Market P: {r.market_prob:.1%}\n" if r.market_prob else "\n", style="dim")
 
-    border = "bright_green" if r.bet_type != "PASS" else "dim"
+    if getattr(r, "notes", None):
+        body.append(f"\n  [dim]Note: {r.notes}[/dim]\n")
+
+    border = "bright_green" if r.bet_type not in ("PASS", "") else "dim"
     console.print(Panel(
         body,
         title=f"[bold white]BET RECOMMENDATION  {home_name} vs {away_name}[/]",
@@ -337,3 +343,73 @@ def print_match_summary_table(rows: list[dict], league_name: str) -> None:
             Text(dc_s, style="dim cyan"),
         )
     console.print(t)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gen 3 adapter functions — alias untuk run_realtime.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+def display_header() -> None:
+    """Alias untuk print_header() — kompatibel dengan run_realtime.py."""
+    print_header()
+
+
+def display_data_sources(sources: dict[str, str], league_key: str = "") -> None:
+    """Alias untuk print_data_sources()."""
+    print_data_sources(sources, league_key)
+
+
+def display_match(prob, fixture: dict, bet, elo=None, h2h=None,
+                  ens_result=None, movement=None, cfg: dict = None) -> None:
+    """
+    Tampilkan satu pertandingan lengkap: prob + strength + bet + ELO + movement.
+    Wrapper terpusat untuk run_realtime.py.
+    """
+    home = fixture.get("home", prob.home_team)
+    away = fixture.get("away", prob.away_team)
+    cfg  = cfg or {}
+
+    # Main probability display
+    print_probability(prob, home, away)
+    print_recommendation(bet, home, away)
+
+    # ELO info
+    if elo and cfg.get("display", {}).get("show_elo_ratings", True):
+        elo_line = (
+            f"  [dim]ELO:[/] [cyan]{home}[/] {elo.rating_home:.0f}  "
+            f"vs  [cyan]{away}[/] {elo.rating_away:.0f}  "
+            f"[dim]({elo.confidence} confidence, {'home favored' if elo.home_favored else 'away favored'})[/]"
+        )
+        console.print(elo_line)
+
+    # H2H info
+    if h2h and h2h.matches_analyzed >= 4 and cfg.get("display", {}).get("show_h2h", True):
+        h2h_line = (
+            f"  [dim]H2H ({h2h.matches_analyzed} matches):[/] "
+            f"[green]W {h2h.home_win_pct:.0%}[/]  "
+            f"[yellow]D {h2h.draw_pct:.0%}[/]  "
+            f"[red]L {h2h.away_win_pct:.0%}[/]  "
+            f"[dim]last 5: {' '.join(h2h.last_5_results)}[/]"
+        )
+        console.print(h2h_line)
+
+    # Ensemble weights
+    if ens_result and cfg.get("display", {}).get("show_ensemble_weights", True):
+        console.print(
+            f"  [dim]Ensemble:[/] model {ens_result.w_model:.0%} "
+            f"/ elo {ens_result.w_elo:.0%} "
+            f"/ h2h {ens_result.w_h2h:.0%}  "
+            f"[dim]({ens_result.mode})[/]"
+        )
+
+    # Line movement
+    if movement and movement.signal != "NEUTRAL":
+        sig_colors = {
+            "SHARP_HOME":  "bright_green", "SHARP_AWAY":  "bright_red",
+            "STEAM_OVER":  "cyan",         "STEAM_UNDER": "magenta",
+        }
+        col = sig_colors.get(movement.signal, "yellow")
+        console.print(f"  [{col}]⚡ Line movement: {movement.signal}[/]  "
+                       f"[dim]({movement.snapshots} snapshots tracked)[/]")
+
+    console.print()
