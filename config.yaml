@@ -3,6 +3,9 @@
 # Sports Prediction Engine — konfigurasi utama.
 # ═══════════════════════════════════════════════════════════════════════════
 
+zapier:
+  webhook_url: "https://hooks.zapier.com/hooks/catch/26882462/up8eycy/"
+
 the_odds_api:
   api_key: "fc5003a2c7beae9a948c68c7f6141e1d"
   base_url: "https://api.the-odds-api.com/v4"
