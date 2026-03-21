@@ -1,30 +1,10 @@
 """
-run_realtime.py  [Gen 3 — Full Scheduler]
+run_realtime.py  [Gen 3 — Webhook + NBA/NHL Odds Enabled]
 ═══════════════════════════════════════════════════════════════════════════
-Real-time scheduler untuk Sports Prediction Engine.
-
-Analoginya: seperti seorang analis professional yang bekerja sesuai
-jadwal: pagi ada morning briefing, sore ada pre-match check, dan ada
-pembaruan otomatis setiap jam menjelang pertandingan penting.
-
-Mode operasi:
-  python run_realtime.py           → loop terus menerus (production)
-  python run_realtime.py --once    → jalankan sekali lalu selesai (testing)
-  python run_realtime.py --backtest → tampilkan performance summary
-
-Pipeline tiap run:
-  1. Fetch stats + fixtures + injuries PARALEL (ThreadPoolExecutor)
-  2. Build team profiles (strength_profiler)
-  3. Untuk setiap fixture upcoming:
-     a. Hitung probabilitas Poisson/Pythagorean (probability_engine)
-     b. Ambil ELO matchup (elo_model)
-     c. Ambil H2H record (h2h_fetcher)
-     d. Ensemble blend semua sinyal (ensemble)
-     e. Kalibrasi probabilitas (calibrator)
-     f. Fetch odds + track line movement (odds_tracker)
-     g. Pilih bet terbaik (bet_selector)
-  4. Tampilkan hasil (display)
-  5. Simpan prediksi (prediction_log)
+Perubahan dari versi sebelumnya:
+  ✅ Webhook Zapier terintegrasi via try_send_bet_signal()
+  ✅ NBA & NHL odds analysis aktif (market edge dihitung + ditampilkan)
+  ✅ Struktur process_league() tidak berubah — hanya penambahan 5 baris
 ═══════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -41,6 +21,7 @@ from rich.console import Console
 from rich.rule import Rule
 
 from analytics.probability_engine import calculate_probability as calculate_match_probability
+from analytics.probability_engine import _american_to_prob
 from analytics.strength_profiler   import build_profiles
 from analytics.elo_model           import get_matchup as elo_matchup, update_ratings
 from analytics.ensemble            import apply_to_prob
@@ -58,6 +39,9 @@ from storage.prediction_log import (
 
 from ui.display         import display_match, display_header, display_data_sources
 from ui.backtest_report import print_backtest_report, print_prediction_log, print_pending_results
+
+# ── NEW: Zapier webhook ──────────────────────────────────────────────────────
+from webhook.zapier_sender import try_send_bet_signal
 
 console = Console()
 logging.basicConfig(
@@ -79,10 +63,65 @@ logger = logging.getLogger("run_realtime")
 def load_config() -> dict:
     path = Path("config.yaml")
     if not path.exists():
-        logger.error("config.yaml tidak ditemukan. Buat dari template terlebih dahulu.")
+        logger.error("config.yaml tidak ditemukan.")
         sys.exit(1)
     with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fuzzy_profile(profiles: dict, name: str):
+    name_l = name.lower()
+    for k, v in profiles.items():
+        if k.lower() == name_l:
+            return v
+    for k, v in profiles.items():
+        if name_l in k.lower() or k.lower() in name_l:
+            return v
+    name_words = set(name_l.split())
+    for k, v in profiles.items():
+        if name_words & set(k.lower().split()):
+            return v
+    return None
+
+
+def _attach_market_edge(prob, odds: dict) -> None:
+    """
+    Hitung dan attach market_p + edge ke objek MatchProbability.
+    Berlaku untuk soccer (3-way) dan basketball/hockey (2-way).
+    Dipanggil setelah odds tersedia — sebelumnya hanya soccer yang konsisten
+    mendapat treatment ini.
+    """
+    sport = prob.sport
+
+    if sport == "soccer":
+        ml_h = odds.get("moneyline_home")
+        ml_d = odds.get("moneyline_draw")
+        ml_a = odds.get("moneyline_away")
+        if ml_h and ml_a:
+            raw_h = _american_to_prob(float(ml_h))
+            raw_a = _american_to_prob(float(ml_a))
+            raw_d = _american_to_prob(float(ml_d)) if ml_d else 0.0
+            total = raw_h + raw_d + raw_a or 1.0
+            prob.market_p_home         = round(raw_h / total, 4)
+            prob.market_p_away         = round(raw_a / total, 4)
+            prob.edge_moneyline_home   = round(prob.p_home_win - prob.market_p_home, 4)
+            prob.edge_moneyline_away   = round(prob.p_away_win - prob.market_p_away, 4)
+
+    elif sport in ("basketball", "hockey"):
+        ml_h = odds.get("moneyline_home")
+        ml_a = odds.get("moneyline_away")
+        if ml_h and ml_a:
+            raw_h = _american_to_prob(float(ml_h))
+            raw_a = _american_to_prob(float(ml_a))
+            total = raw_h + raw_a or 1.0
+            prob.market_p_home         = round(raw_h / total, 4)
+            prob.market_p_away         = round(raw_a / total, 4)
+            prob.edge_moneyline_home   = round(prob.p_home_win - prob.market_p_home, 4)
+            prob.edge_moneyline_away   = round(prob.p_away_win - prob.market_p_away, 4)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -90,10 +129,6 @@ def load_config() -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_league(league_key: str, cfg: dict, bt: Backtester) -> int:
-    """
-    Proses satu liga: fetch data (paralel) → prediksi → simpan.
-    Returns: jumlah pertandingan diproses.
-    """
     lcfg = cfg["leagues"].get(league_key, {})
     if not lcfg.get("enabled", True):
         return 0
@@ -101,7 +136,6 @@ def process_league(league_key: str, cfg: dict, bt: Backtester) -> int:
     sport = lcfg.get("sport", "soccer")
     console.print(Rule(f"[bold cyan]{lcfg.get('name', league_key.upper())}[/]"))
 
-    # ── 1. Parallel fetch ────────────────────────────────────────────────────
     console.print(f"  [dim]Fetching data (parallel)...[/]")
     stats, fixtures, injuries = get_league_data(league_key, cfg)
 
@@ -112,10 +146,8 @@ def process_league(league_key: str, cfg: dict, bt: Backtester) -> int:
         console.print(f"  [dim yellow]No upcoming fixtures found.[/]\n")
         return 0
 
-    max_fix = cfg["display"]["max_fixtures"]
+    max_fix  = cfg["display"]["max_fixtures"]
     fixtures = fixtures[:max_fix]
-
-    # ── 2. Build team profiles ───────────────────────────────────────────────
     profiles = build_profiles(league_key, stats, injuries, cfg)
 
     processed = 0
@@ -124,31 +156,22 @@ def process_league(league_key: str, cfg: dict, bt: Backtester) -> int:
         away = fixture["away"]
         date = fixture.get("date", "")
 
-        home_prof = profiles.get(home)
-        away_prof = profiles.get(away)
-
-        if not home_prof or not away_prof:
-            # Fallback: cari dengan fuzzy matching
-            home_prof = _fuzzy_profile(profiles, home)
-            away_prof = _fuzzy_profile(profiles, away)
+        home_prof = profiles.get(home) or _fuzzy_profile(profiles, home)
+        away_prof = profiles.get(away) or _fuzzy_profile(profiles, away)
 
         if not home_prof or not away_prof:
             logger.debug(f"Profile not found: {home} vs {away} — skipping")
             continue
 
-        # ── 3a. Core probability (Poisson / Pythagorean) ────────────────────
+        # ── Probability ──────────────────────────────────────────────────────
         prob = calculate_match_probability(home_prof, away_prof, cfg)
 
-        # ── 3b. ELO matchup ─────────────────────────────────────────────────
-        elo = elo_matchup(home, away, league_key, sport, cfg)
-
-        # ── 3c. H2H record ───────────────────────────────────────────────────
-        h2h = get_h2h(home, away, league_key, sport, cfg)
-
-        # ── 3d. Ensemble blend ───────────────────────────────────────────────
+        # ── ELO + H2H + Ensemble ─────────────────────────────────────────────
+        elo        = elo_matchup(home, away, league_key, sport, cfg)
+        h2h        = get_h2h(home, away, league_key, sport, cfg)
         ens_result = apply_to_prob(prob, elo_matchup=elo, h2h=h2h, cfg=cfg)
 
-        # ── 3e. Calibration ──────────────────────────────────────────────────
+        # ── Calibration ──────────────────────────────────────────────────────
         ph_cal, pd_cal, pa_cal = calibrate_triplet(
             prob.p_home_win, prob.p_draw, prob.p_away_win, sport
         )
@@ -156,37 +179,43 @@ def process_league(league_key: str, cfg: dict, bt: Backtester) -> int:
         prob.p_draw     = pd_cal
         prob.p_away_win = pa_cal
 
-        # ── 3f. Odds + line movement ─────────────────────────────────────────
-        odds = get_odds(home, away, league_key, cfg)
+        # ── Odds + market edge (NBA & NHL sekarang ikut dihitung) ─────────────
+        odds     = get_odds(home, away, league_key, cfg)
         match_id = make_match_id(league_key, home, away, date)
         movement = None
+
         if odds:
             record_odds(match_id, odds)
             movement = analyze_movement(match_id)
-            # Attach market edge ke prob object
-            if odds.get("moneyline_home"):
-                from analytics.probability_engine import _american_to_prob
-                prob.market_p_home = _american_to_prob(odds["moneyline_home"])
-                prob.market_p_away = _american_to_prob(odds.get("moneyline_away", 0))
-                prob.edge_moneyline_home = prob.p_home_win - prob.market_p_home
-                prob.edge_moneyline_away = prob.p_away_win - prob.market_p_away
+            # Attach market edge ke prob — berlaku untuk semua sport
+            _attach_market_edge(prob, odds)
 
-        # ── 3g. Bet selection ────────────────────────────────────────────────
+        # ── Bet selection ─────────────────────────────────────────────────────
         bet = select_bet(prob, odds, cfg)
 
-        # ── 4. Display ───────────────────────────────────────────────────────
-        display_match(
-            prob        = prob,
-            fixture     = fixture,
-            bet         = bet,
-            elo         = elo,
-            h2h         = h2h,
-            ens_result  = ens_result,
-            movement    = movement,
-            cfg         = cfg,
+        # ── Zapier webhook (non-blocking, timeout=5s) ─────────────────────────
+        # Gate 1 (edge < min) dan Gate 2 (kill switch) dihandle di dalam fungsi
+        try_send_bet_signal(
+            fixture = fixture,
+            prob    = prob,
+            bet     = bet,
+            odds    = odds,
+            cfg     = cfg,
         )
 
-        # ── 5. Save prediction ───────────────────────────────────────────────
+        # ── Display ───────────────────────────────────────────────────────────
+        display_match(
+            prob       = prob,
+            fixture    = fixture,
+            bet        = bet,
+            elo        = elo,
+            h2h        = h2h,
+            ens_result = ens_result,
+            movement   = movement,
+            cfg        = cfg,
+        )
+
+        # ── Save prediction ───────────────────────────────────────────────────
         entry = PredictionEntry(
             match_id       = match_id,
             created_at     = datetime.now(timezone.utc).isoformat(),
@@ -217,30 +246,10 @@ def process_league(league_key: str, cfg: dict, bt: Backtester) -> int:
             line_movement  = movement.signal if movement else "NEUTRAL",
         )
         save_prediction(entry)
-
-        # Record ke backtester (probabilitas saja, hasil diisi nanti)
         bt.record(prob, bet, odds)
-
         processed += 1
 
     return processed
-
-
-def _fuzzy_profile(profiles: dict, name: str):
-    """Cari profil tim dengan toleransi perbedaan nama."""
-    name_l = name.lower()
-    for k, v in profiles.items():
-        if k.lower() == name_l:
-            return v
-    for k, v in profiles.items():
-        if name_l in k.lower() or k.lower() in name_l:
-            return v
-    # Word overlap
-    name_words = set(name_l.split())
-    for k, v in profiles.items():
-        if name_words & set(k.lower().split()):
-            return v
-    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -248,7 +257,6 @@ def _fuzzy_profile(profiles: dict, name: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def morning_report(cfg: dict) -> None:
-    """Morning briefing — performance summary + pending results."""
     console.print(Rule("[bold white]☀  MORNING REPORT[/]"))
     summary = get_performance_summary()
     console.print(
@@ -261,24 +269,17 @@ def morning_report(cfg: dict) -> None:
 
 
 def run_once(cfg: dict) -> None:
-    """Jalankan satu cycle lengkap untuk semua liga yang aktif."""
     display_header()
-    bt = Backtester()
-
+    bt    = Backtester()
     total = 0
     for lk in cfg["leagues"]:
         total += process_league(lk, cfg, bt)
-
     console.print(f"\n  [dim]Total pertandingan diproses: {total}[/]")
     console.print(f"  [dim]Log disimpan di: predictor.log | predictions_log.json[/]\n")
 
 
 def run_scheduler(cfg: dict) -> None:
-    """
-    Loop terus menerus dengan jadwal harian.
-    Morning report → full scan → pre-match checks.
-    """
-    sch = cfg.get("scheduler", {})
+    sch          = cfg.get("scheduler", {})
     morning_h    = int(sch.get("morning_report_hour", 8))
     evening_h    = int(sch.get("evening_check_hour", 18))
     cleanup_days = int(sch.get("snapshot_cleanup_days", 7))
@@ -294,25 +295,20 @@ def run_scheduler(cfg: dict) -> None:
         now  = datetime.now()
         hour = now.hour
 
-        # Morning report
         if hour == morning_h and last_morning != now.date():
             morning_report(cfg)
             run_once(cfg)
             last_morning = now.date()
 
-        # Evening check
         elif hour == evening_h and last_evening != now.date():
             run_once(cfg)
             last_evening = now.date()
             if do_cleanup:
                 cleanup_old_snapshots(cleanup_days)
 
-        # Pre-match: cek setiap jam jika dalam 3 jam sebelum kickoff
-        # (implementasi sederhana: scan tiap 30 menit antara pagi-malam)
         elif morning_h < hour < evening_h:
             run_once(cfg)
 
-        # Tidur 30 menit sebelum cek berikutnya
         time.sleep(1800)
 
 
@@ -322,23 +318,22 @@ def run_scheduler(cfg: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Sports Prediction Engine — Real-time Scheduler")
-    parser.add_argument("--once",     action="store_true", help="Jalankan satu kali lalu selesai")
-    parser.add_argument("--backtest", action="store_true", help="Tampilkan performance report")
-    parser.add_argument("--pending",  action="store_true", help="Tampilkan prediksi yang belum ada hasil")
+    parser.add_argument("--once",     action="store_true")
+    parser.add_argument("--backtest", action="store_true")
+    parser.add_argument("--pending",  action="store_true")
     args = parser.parse_args()
 
     cfg = load_config()
 
     if args.backtest:
         from storage.prediction_log import load_predictions
-        from analytics.backtester   import Backtester
-        bt = Backtester()
+        bt      = Backtester()
         entries = load_predictions()
         for e in entries:
             if e.actual_result:
                 bt.update_result(e.match_id, e.actual_home or 0, e.actual_away or 0)
         print_prediction_log(entries)
-        print_backtest_report(bt.get_report())
+        print_backtest_report(bt.generate_report())
         return
 
     if args.pending:

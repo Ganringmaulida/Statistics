@@ -1,6 +1,4 @@
-# config.yaml  [Gen 3 — Updated]
-# ═══════════════════════════════════════════════════════════════════════════
-# Sports Prediction Engine — konfigurasi utama.
+# config.yaml  [Gen 3 — Updated + Webhook Integration]
 # ═══════════════════════════════════════════════════════════════════════════
 
 zapier:
@@ -18,6 +16,17 @@ balldontlie:
   api_key: "fbcd079a-e024-4d6d-a857-1b4392b84d8e"
   base_url: "https://api.balldontlie.io/v1"
 
+# ── Webhook + Risk Management ────────────────────────────────────────────────
+webhook:
+  min_edge_for_webhook: 0.12     # Gate 1: edge minimum sebelum signal dikirim
+
+bankroll:
+  current_bankroll:   58.40      # Update manual setiap sesi
+  starting_bankroll:  60.00      # Reset setiap hari
+  daily_pnl:          0.00       # Update setelah setiap bet selesai (negatif = rugi)
+  max_daily_loss_pct: 0.08       # Gate 2: Kill Switch aktif di 8%
+
+# ── Leagues ──────────────────────────────────────────────────────────────────
 leagues:
   epl:
     name: "English Premier League"
@@ -25,44 +34,49 @@ leagues:
     understat_name: "EPL"
     api_football_id: 39
     odds_key: "soccer_epl"
-    odds_enabled: true          # ← aktif: pakai Odds-API credits
+    odds_enabled: true
     season: 2024
     enabled: true
+
   ucl:
     name: "UEFA Champions League"
     sport: "soccer"
     understat_name: ""
     api_football_id: 2
     odds_key: "soccer_uefa_champs_league"
-    odds_enabled: true          # ← aktif: pakai Odds-API credits
+    odds_enabled: true
     season: 2024
     enabled: true
+
   nba:
     name: "NBA"
     sport: "basketball"
     api_football_id: null
     odds_key: "basketball_nba"
-    odds_enabled: true   # ← nonaktif: hemat credits
+    odds_enabled: true            # ← AKTIF
     season: 2024
     enabled: true
+
   nhl:
     name: "NHL"
     sport: "hockey"
     api_football_id: null
     odds_key: "icehockey_nhl"
-    odds_enabled: true       # ← nonaktif: hemat credits
+    odds_enabled: true            # ← AKTIF
     season: "20242025"
     enabled: true
 
+# ── Model Parameters ─────────────────────────────────────────────────────────
 model:
-  home_advantage_goals: 0.35
-  dixon_coles_rho: -0.13
-  nba_pythagorean_exp: 13.91
-  nhl_pythagorean_exp: 2.37
-  min_edge_moneyline: 0.05
-  edge_medium_confidence: 0.07
-  edge_high_confidence: 0.12
+  home_advantage_goals:     0.35
+  dixon_coles_rho:          -0.13
+  nba_pythagorean_exp:      13.91
+  nhl_pythagorean_exp:      2.37
+  min_edge_moneyline:       0.05
+  edge_medium_confidence:   0.07
+  edge_high_confidence:     0.12
   team_similarity_threshold: 0.80
+  injury_penalty_per_key:   0.08
 
 ensemble:
   model_weight: 0.65
@@ -83,18 +97,16 @@ storage:
   results_path:    "storage/results.json"
 
 display:
-  max_fixtures: 5
-  fixtures_days_ahead: 7
-  show_data_source: true
-  show_elo_ratings: true
-  show_h2h: true
+  max_fixtures:          5
+  fixtures_days_ahead:   7
+  show_data_source:      true
+  show_elo_ratings:      true
+  show_h2h:              true
   show_ensemble_weights: true
 
 scheduler:
-  morning_report_hour: 8
-  evening_check_hour: 18
-  pre_match_hours: 3
-  overnight_cleanup: true
-  snapshot_cleanup_days: 7
-
-  
+  morning_report_hour:    8
+  evening_check_hour:     18
+  pre_match_hours:        3
+  overnight_cleanup:      true
+  snapshot_cleanup_days:  7
